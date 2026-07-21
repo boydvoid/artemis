@@ -16,10 +16,16 @@
 //
 // Editing is staged, never immediate: a value only reaches the database
 // when the user commits the batch.
+//
+// Clicking a row opens the inspector: a side panel with every value in the
+// row at full length. The grid truncates by column width — that is what
+// keeps it a grid — so the panel is where a long value is actually read,
+// resized (textareas) and copied.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, TableProperties } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Copy, TableProperties, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { editText, isNullField } from "@/lib/parse";
 import type { Page } from "@/lib/parse";
 import type { Sort } from "@/lib/sql";
 
@@ -74,6 +80,9 @@ export default function DataGrid({
   const [widths, setWidths] = useState<Record<string, number>>({});
   const [editing, setEditing] = useState<{ r: number; c: number } | null>(null);
   const [draft, setDraft] = useState("");
+  /// The inspected row, by page index. Page-scoped view state: a new shape
+  /// or page describes different rows, so it resets with them.
+  const [selected, setSelected] = useState<number | null>(null);
   const dragRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
 
   // A new result shape means the remembered widths no longer describe these
@@ -82,7 +91,18 @@ export default function DataGrid({
   useEffect(() => {
     setWidths({});
     setEditing(null);
+    setSelected(null);
   }, [shape]);
+
+  // Escape closes the inspector — unless a cell editor is open, whose own
+  // Escape must win (one press should never cancel an edit AND the panel).
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape" && editing === null) setSelected(null);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [editing]);
 
   const resolved = useMemo(
     () => page.cols.map((col, i) => widths[col] ?? autoWidth(col, page.rows, i)),
@@ -131,15 +151,18 @@ export default function DataGrid({
 
   function beginEdit(r: number, c: number) {
     if (!editable) return;
-    setDraft(valueAt(r, c));
+    // A NULL cell opens as the text "NULL" — committing it back unchanged
+    // stays NULL, and clearing it stages a real empty string.
+    setDraft(editText(valueAt(r, c)));
     setEditing({ r, c });
   }
 
   function commitEdit() {
     if (!editing) return;
     // Staging an unchanged value is a no-op, so a stray double-click never
-    // dirties the batch.
-    if (draft !== (page.rows[editing.r][editing.c] ?? "")) {
+    // dirties the batch. Compared in editing representation: a NULL cell's
+    // draft starts as "NULL", not as the marker byte.
+    if (draft !== editText(page.rows[editing.r][editing.c] ?? "")) {
       onStage(editing.r, editing.c, draft);
     }
     setEditing(null);
@@ -155,9 +178,12 @@ export default function DataGrid({
   }
 
   const totalWidth = resolved.reduce((sum, w) => sum + w, 0);
+  // The selected index can outlive its row when a smaller page arrives.
+  const inspected = selected !== null && selected < page.rows.length ? selected : null;
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto">
+    <div className="flex min-h-0 min-w-0 flex-1">
+      <div className="min-h-0 min-w-0 flex-1 overflow-auto">
       <table
         className="grid-table font-mono text-[12.5px]"
         style={{ width: totalWidth }}
@@ -223,7 +249,11 @@ export default function DataGrid({
         </thead>
         <tbody>
           {page.rows.map((row, r) => (
-            <tr key={page.keys[r] ?? r} className="group">
+            <tr
+              key={page.keys[r] ?? r}
+              className={cn("group", inspected === r && "row-inspected")}
+              onClick={() => setSelected(r)}
+            >
               <td
                 className="grid-gutter text-[11px] text-faint group-hover:text-amber"
                 title={page.keys[r] ?? ""}
@@ -244,7 +274,7 @@ export default function DataGrid({
                         "bg-amber/10 text-amber shadow-[inset_2px_0_0_var(--amber)] group-hover:bg-amber/15",
                     )}
                     style={{ width: resolved[c], minWidth: resolved[c] }}
-                    title={isEditing ? undefined : value}
+                    title={isEditing ? undefined : editText(value)}
                     onDoubleClick={() => beginEdit(r, c)}
                   >
                     {isEditing ? (
@@ -264,9 +294,12 @@ export default function DataGrid({
                           }
                         }}
                       />
-                    ) : value.length === 0 ? (
+                    ) : isNullField(value) ? (
                       <span className="text-[11px] italic text-faint">NULL</span>
                     ) : (
+                      // An empty string renders as an empty cell — it is
+                      // not NULL, and pretending otherwise was the old
+                      // text-format ambiguity this marker removes.
                       value
                     )}
                   </td>
@@ -276,6 +309,196 @@ export default function DataGrid({
           ))}
         </tbody>
       </table>
+      </div>
+
+      {inspected !== null && (
+        <RowPanel
+          cols={page.cols}
+          row={page.rows[inspected]}
+          rowKey={page.keys[inspected] ?? ""}
+          rowNumber={inspected + 1}
+          keyed={keyed}
+          staged={staged}
+          editable={editable}
+          onEdit={(c, value) => onStage(inspected, c, value)}
+          onClose={() => setSelected(null)}
+        />
+      )}
     </div>
+  );
+}
+
+/// One field in the inspector. Values live in real form controls so they
+/// select and copy like text anywhere else; long ones get a textarea that
+/// can be resized to read in place.
+///
+/// On editable views the fields edit directly: focus takes a local draft,
+/// blur stages it through the same lifecycle as a grid cell edit — nothing
+/// reaches the database until Commit. Enter commits a single-line field,
+/// Escape abandons the draft (and only the draft: the panel stays open).
+function PanelField(props: {
+  name: string;
+  value: string;
+  pending: boolean;
+  editable: boolean;
+  onCommit: (value: string) => void;
+}) {
+  const { name, value, pending, editable, onCommit } = props;
+  const [copied, setCopied] = useState(false);
+  /// The in-progress edit; null when not editing. Kept local so typing
+  /// does not stage on every keystroke.
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const isNull = isNullField(value);
+  // Everything renders in editing representation: a NULL cell reads as the
+  // text NULL, which is also exactly what commits back as SQL NULL.
+  const text = draft ?? editText(value);
+  const long = text.length > 64 || text.includes("\n");
+
+  async function copy() {
+    const clipboardText = isNull ? "" : editText(value);
+    try {
+      await navigator.clipboard.writeText(clipboardText);
+    } catch {
+      // zero:// origins may not grant the async clipboard API; the
+      // selection-based path works everywhere a WebView does.
+      const scratch = document.createElement("textarea");
+      scratch.value = clipboardText;
+      document.body.appendChild(scratch);
+      scratch.select();
+      document.execCommand("copy");
+      scratch.remove();
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+
+  function commit() {
+    if (draft === null) return;
+    onCommit(draft);
+    setDraft(null);
+  }
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
+    if (event.key === "Escape") {
+      // Abandon the draft only — the window-level Escape (which closes the
+      // panel) must not see this press.
+      event.stopPropagation();
+      setDraft(null);
+      event.currentTarget.blur();
+    }
+    if (event.key === "Enter" && event.currentTarget.tagName === "INPUT") {
+      event.currentTarget.blur(); // blur commits
+    }
+  }
+
+  const shared = {
+    value: text,
+    readOnly: !editable,
+    spellCheck: false,
+    "aria-label": name,
+    onFocus: () => {
+      if (editable && draft === null) setDraft(editText(value));
+    },
+    onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      if (editable) setDraft(event.target.value);
+    },
+    onBlur: commit,
+    onKeyDown,
+  };
+
+  const control = cn(
+    "w-full rounded-[4px] border bg-background px-1.5 font-mono text-[11.5px] outline-none focus:border-ring",
+    pending ? "border-amber/50 text-amber" : "border-hairline text-foreground",
+    // An untouched NULL reads as what it is; typing takes normal styling.
+    isNull && draft === null && "text-faint italic",
+  );
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <span
+          className="min-w-0 flex-1 overflow-hidden font-mono text-[10px] tracking-[0.08em] text-ellipsis whitespace-nowrap text-faint uppercase"
+          title={name}
+        >
+          {name}
+          {pending && <span className="ml-1.5 text-amber normal-case">staged</span>}
+        </span>
+        <button
+          className="flex-none p-0.5 text-faint transition-colors hover:text-amber"
+          onClick={() => void copy()}
+          title={`Copy ${name}`}
+          aria-label={`Copy ${name}`}
+        >
+          {copied ? <Check className="size-3 text-amber" /> : <Copy className="size-3" />}
+        </button>
+      </div>
+
+      {!editable && isNull ? (
+        <span className="px-1.5 py-1 text-[11px] italic text-faint">NULL</span>
+      ) : long ? (
+        <textarea {...shared} className={cn(control, "h-[92px] resize-y py-1 leading-relaxed")} />
+      ) : (
+        <input {...shared} className={cn(control, "h-6")} />
+      )}
+    </div>
+  );
+}
+
+/// The row inspector. Fields edit in place on editable views, staging
+/// through the same batch as grid cell edits — the panel shows staged
+/// values marked as such rather than pretending they are committed.
+function RowPanel(props: {
+  cols: readonly string[];
+  row: readonly string[];
+  rowKey: string;
+  rowNumber: number;
+  keyed: boolean;
+  staged: ReadonlyMap<string, string>;
+  editable: boolean;
+  onEdit: (colIndex: number, value: string) => void;
+  onClose: () => void;
+}) {
+  const { cols, row, rowKey, rowNumber, keyed, staged, editable, onEdit, onClose } = props;
+
+  return (
+    <aside
+      className="flex w-[300px] flex-none flex-col border-l border-border bg-card"
+      aria-label={`Row ${rowNumber} details`}
+    >
+      <header className="flex flex-none items-center gap-2 border-b border-hairline px-3 py-2">
+        <span className="font-mono text-[10px] tracking-[0.1em] text-faint uppercase">row</span>
+        <span className="font-mono text-[12px] text-foreground">{rowNumber}</span>
+        {keyed && rowKey.length > 0 && (
+          <span className="min-w-0 overflow-hidden font-mono text-[10px] text-ellipsis whitespace-nowrap text-faint" title={rowKey}>
+            {rowKey}
+          </span>
+        )}
+        <span className="flex-1" />
+        <button
+          className="p-0.5 text-faint transition-colors hover:text-amber"
+          onClick={onClose}
+          aria-label="Close row details"
+        >
+          <X className="size-3.5" />
+        </button>
+      </header>
+
+      <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto px-3 py-2.5">
+        {cols.map((name, c) => {
+          const pendingValue = staged.get(`${rowKey}:${c}`);
+          return (
+            <PanelField
+              key={name + c}
+              name={name}
+              value={pendingValue !== undefined ? pendingValue : (row[c] ?? "")}
+              pending={pendingValue !== undefined}
+              editable={editable}
+              onCommit={(value) => onEdit(c, value)}
+            />
+          );
+        })}
+      </div>
+    </aside>
   );
 }

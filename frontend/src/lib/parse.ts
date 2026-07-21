@@ -9,6 +9,22 @@
 
 import { RS, US } from "./bridge";
 
+/// What psql prints for SQL NULL (`-P null=` on the native side). With it,
+/// NULL and empty string are finally distinguishable: an empty field is a
+/// real empty string, and this marker is NULL.
+export const NULL_FIELD = "\x01";
+
+export function isNullField(value: string): boolean {
+  return value === NULL_FIELD;
+}
+
+/// The editing representation of a raw field: a NULL cell opens as the
+/// text "NULL", which is also what commits back as SQL NULL — the same
+/// convention the app has always had, now round-trip coherent.
+export function editText(value: string): string {
+  return value === NULL_FIELD ? "NULL" : value;
+}
+
 export interface TableRef {
   id: string;
   schema: string;

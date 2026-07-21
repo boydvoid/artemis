@@ -99,6 +99,19 @@ React  ──  window.zero.invoke("db.exec",    { url, sql })  ──▶  psql  
 Both commands share one contract: send SQL, get raw framed stdout back, and
 a failing statement is *data* (`ok:false` plus stderr), not a bridge fault.
 
+Queries run **off the loop thread**: `db.exec` and `store.exec` are async
+bridge handlers, so a slow query never freezes the window. The handler
+copies the request and spawns a worker; the worker runs the subprocess and
+nudges the platform loop, which completes the bridge response on the loop
+thread — the only thread the WebView may be spoken to from.
+
+A result too large for one bridge response (the SDK caps a response at
+1 MiB) is stashed native-side and delivered in pieces: the first reply
+carries a `more` handle, and `frontend/src/lib/bridge.ts` pulls the rest
+through `db.chunk` before handing callers one complete result. Callers
+never see the seam. The end of the line is an 8 MiB stdout cap, reported
+honestly as `truncated`.
+
 `store.exec` reads and writes the same SQLite schema the canvas app used —
 `connections`, `saved_queries`, plus an additive `app_state` key/value table
 for things like the selected connection. The store lives in the OS
@@ -110,7 +123,9 @@ Set `ARTEMIS_DB` to point it elsewhere — that is how you share one file
 with the canvas app, which still uses its own `legacy/.artemis/artemis.db`.
 
 `out` is raw psql stdout in unit/record-separator framing
-(`-A -F <US> -R <RS>`), the same format the native app used. All parsing
+(`-A -F <US> -R <RS>`), the same format the native app used, plus
+`-P null=<0x01>` so SQL `NULL` arrives as a marker byte and is finally
+distinguishable from an empty string. All parsing
 happens in TypeScript (`frontend/src/lib/parse.ts`), all SQL construction
 in `frontend/src/lib/sql.ts` — both ported from `legacy/src/pg.ts` and
 `legacy/src/core.ts`. `src/main.zig` builds no SQL and interprets no results;
@@ -188,6 +203,13 @@ with a probe row and a page-size picker (25/50/100/250, per tab), psql
 errors surfaced verbatim, session restore on reopen, and a results grid
 with real per-column min-widths, horizontal scroll, a pinned header and row
 gutter, and drag-resizable columns (double-click a divider to reset).
+Clicking a row opens an inspector panel with every value at full length —
+long values in resizable textareas, a copy button per field — since the
+grid itself truncates by column width. On table views the panel's fields
+edit in place: blur stages the change into the same batch as a grid cell
+edit, shown amber until Commit, and typing `NULL` back into a staged field
+un-stages it. Escape closes the panel (or just the field draft while
+editing one).
 
 ### SQL editor
 
@@ -224,8 +246,11 @@ an app restart, deliberately.
 Editing is only offered for keyed table views: a join or an expression
 has no single row to write back to.
 
-The literal text `NULL` sets a column NULL (inherited from the native
-app), which means you cannot store the four characters "NULL".
+`NULL` and empty string are distinct: a NULL cell shows a dimmed marker,
+an empty string shows an empty cell. Editing a NULL cell opens the text
+`NULL`, and committing the literal text `NULL` sets the column NULL — the
+convention inherited from the native app, now round-trip coherent. It
+still means you cannot store the four characters "NULL".
 
 ### Query builder
 
@@ -287,15 +312,14 @@ open tab intact, just no longer linked.
 
 ## Known limitations
 
-- Bridge handlers dispatch **synchronously** on the loop thread, so a slow
-  query blocks the window until psql returns. The fix is the SDK's async
-  bridge registry (`AsyncHandler` in `bridge/root.zig`).
-- Results are capped at ~700 KB per query at the bridge; over that the
-  response comes back with `truncated: true` and the UI says so.
-- psql's text format cannot distinguish SQL `NULL` from an empty string —
-  both arrive as an empty field. The grid renders both as `NULL`. This
-  ambiguity is inherited from the native app; only a real driver
-  (`node-postgres`) or a JSON-returning query would remove it.
+- Results are capped at 8 MiB of psql stdout per query; up to that they
+  arrive whole (chunked across bridge responses when large), beyond it the
+  query fails with a clear message.
+- A NULL marker byte (0x01) distinguishes SQL `NULL` from an empty string.
+  A value that genuinely contains a literal 0x01 byte would be misread as
+  NULL — the same class of assumption the US/RS framing already makes.
+- The literal text `NULL` in a cell edit means SQL NULL, so the four
+  characters "NULL" cannot be stored as a string.
 - Connection strings are stored in plaintext in the SQLite file, as they
   were in the canvas app.
 

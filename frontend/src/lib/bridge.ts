@@ -15,6 +15,20 @@ export interface ExecResult {
   truncated: boolean;
 }
 
+/// A result too large for one bridge response arrives in pieces: the first
+/// reply carries a stash handle, and `db.chunk` returns the rest. Callers
+/// never see this — `exec` reassembles before returning.
+interface ChunkedExecResult extends ExecResult {
+  more?: { handle: number; next: number; total: number } | null;
+}
+
+interface Chunk {
+  ok: boolean;
+  data: string;
+  next: number;
+  done: boolean;
+}
+
 interface ZeroApi {
   invoke<T>(command: string, payload?: unknown): Promise<T>;
 }
@@ -47,8 +61,47 @@ async function invoke(command: string, payload: unknown): Promise<ExecResult> {
 }
 
 /// Run SQL against a connected Postgres database (psql, native side).
-export function exec(url: string, sql: string): Promise<ExecResult> {
-  return invoke("db.exec", { url, sql });
+/// Oversized results come back in chunks; they are reassembled here so
+/// every caller keeps seeing one complete ExecResult.
+export async function exec(url: string, sql: string): Promise<ExecResult> {
+  const first = (await invoke("db.exec", { url, sql })) as ChunkedExecResult;
+  const base: ExecResult = {
+    ok: first.ok,
+    code: first.code,
+    out: first.out,
+    err: first.err,
+    truncated: first.truncated,
+  };
+  if (!first.more) return base;
+
+  const api = zero();
+  if (!api) return base;
+
+  let out = first.out;
+  let offset = first.more.next;
+  const handle = first.more.handle;
+  try {
+    for (;;) {
+      const chunk = await api.invoke<Chunk>("db.chunk", { handle, offset });
+      if (!chunk.ok) {
+        // The stash evicted this result (too many large queries at once).
+        // A partial result presented as whole would be a silent lie.
+        return {
+          ...base,
+          ok: false,
+          out: "",
+          err: "Result expired before it was fully delivered - run the query again.",
+        };
+      }
+      out += chunk.data;
+      if (chunk.done) break;
+      offset = chunk.next;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ...base, ok: false, out: "", err: message };
+  }
+  return { ...base, out };
 }
 
 /// Run SQL against the app's own SQLite store (sqlite3, native side).

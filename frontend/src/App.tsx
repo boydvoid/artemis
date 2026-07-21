@@ -30,7 +30,7 @@ import {
   type Connection,
   type SavedQuery,
 } from "@/lib/store";
-import { parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
+import { editText, parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
 import { hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
 import {
   DEFAULT_PAGE_SIZE,
@@ -425,7 +425,9 @@ export default function App() {
     const source = tab.source;
 
     const rest = tab.staged.filter((e) => !(e.key === key && e.colIndex === colIndex));
-    const unchanged = value === (tab.page.rows[rowIndex][colIndex] ?? "");
+    // Compared in editing representation: the database's NULL arrives as a
+    // marker byte, but the grid edits it as the text "NULL".
+    const unchanged = value === editText(tab.page.rows[rowIndex][colIndex] ?? "");
     patchTab({
       staged: unchanged
         ? rest

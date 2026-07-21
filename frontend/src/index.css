@@ -176,6 +176,17 @@
 
   /* Revealed on header hover only — 26 columns should not read as 26
      handles. */
+  /* The row the inspector is showing. The gutter number carries the amber
+     so the marker survives horizontal scrolling. */
+  .grid-table tbody tr.row-inspected td {
+    background: color-mix(in oklch, var(--accent) 70%, transparent);
+  }
+
+  .grid-table tbody tr.row-inspected td.grid-gutter {
+    color: var(--amber);
+    box-shadow: inset 2px 0 0 var(--amber);
+  }
+
   .col-resize {
     position: absolute;
     top: 0;
