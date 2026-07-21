@@ -75,7 +75,12 @@ export default function App() {
   // coming back should not throw away the size you chose.
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_HEIGHT);
 
-  const [busy, setBusy] = useState(false);
+  /// Queries can overlap — opening a restored workspace starts the catalog
+  /// load and the active tab's first run together — so busy is a count, not
+  /// a flag: a boolean would be switched off by whichever finishes first,
+  /// hiding the loading state while the slower query is still running.
+  const [busyCount, setBusyCount] = useState(0);
+  const busy = busyCount > 0;
   const [error, setError] = useState("");
 
   /// Session restore bookkeeping. `booted` gates saving so the empty first
@@ -161,7 +166,7 @@ export default function App() {
         return null;
       }
       const started = performance.now();
-      setBusy(true);
+      setBusyCount((count) => count + 1);
       try {
         const result = await exec(active.url, statement);
         const ms = Math.round(performance.now() - started);
@@ -174,7 +179,7 @@ export default function App() {
         setError("");
         return { out: result.out, ms };
       } finally {
-        setBusy(false);
+        setBusyCount((count) => count - 1);
       }
     },
     [active],
@@ -772,6 +777,10 @@ export default function App() {
           </div>
         )}
 
+        {/* A 2px slot that becomes the query-in-flight strip. Always
+            present so nothing shifts when a query starts. */}
+        <div className={cn("h-[2px] flex-none", busy && "loading-strip")} aria-hidden />
+
         <DataGrid
           page={tab.page}
           keyed={tab.source.kind === "table"}
@@ -780,6 +789,7 @@ export default function App() {
           onStage={stageEdit}
           sort={tab.source.kind === "table" ? tab.source.query.sort : []}
           onSort={tab.source.kind === "table" ? toggleSort : undefined}
+          busy={busy}
         />
 
         <footer className="flex h-7 flex-none items-center gap-3 border-t border-border bg-card px-3 font-mono text-[11px] text-muted-foreground">
@@ -804,7 +814,11 @@ export default function App() {
               </span>
             </>
           )}
-          {tab.elapsed > 0 && <span className="text-faint">{tab.elapsed} ms</span>}
+          {busy ? (
+            <span className="animate-pulse text-amber">running</span>
+          ) : (
+            tab.elapsed > 0 && <span className="text-faint">{tab.elapsed} ms</span>
+          )}
           {tab.source.kind !== "none" && (
             <span className="flex items-center gap-0.5">
               <Select

@@ -176,6 +176,33 @@
 
   /* Revealed on header hover only — 26 columns should not read as 26
      handles. */
+  /* The query-in-flight strip: an amber trace sweeping the seam between
+     the controls and the grid. Sized by its container (a fixed 2px slot in
+     App), so appearing and disappearing never shifts layout. */
+  .loading-strip {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .loading-strip::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 35%;
+    background: linear-gradient(90deg, transparent, var(--amber), transparent);
+    animation: loading-strip-sweep 1.1s ease-in-out infinite;
+  }
+
+  @keyframes loading-strip-sweep {
+    from {
+      left: -35%;
+    }
+    to {
+      left: 100%;
+    }
+  }
+
   /* The row the inspector is showing. The gutter number carries the amber
      so the marker survives horizontal scrolling. */
   .grid-table tbody tr.row-inspected td {

@@ -51,6 +51,10 @@ interface Props {
   /// Absent for a free-form query: there is no single table to re-order, and
   /// the statement may carry its own ORDER BY. Headers stay inert then.
   onSort?: (column: string, additive: boolean) => void;
+  /// A query is in flight. Existing rows stay visible but dimmed — they are
+  /// the OLD result, and pretending otherwise would invite edits against
+  /// rows about to be replaced (interaction is disabled while dimmed).
+  busy?: boolean;
 }
 
 /// A first-pass width from the widest sample in the column, clamped. Cheap
@@ -76,6 +80,7 @@ export default function DataGrid({
   onStage,
   sort = [],
   onSort,
+  busy = false,
 }: Props) {
   const [widths, setWidths] = useState<Record<string, number>>({});
   const [editing, setEditing] = useState<{ r: number; c: number } | null>(null);
@@ -169,10 +174,17 @@ export default function DataGrid({
   }
 
   if (page.cols.length === 0) {
+    // Nothing loaded yet. While the first query runs this is the whole
+    // loading state, so it must not read as "nothing to show".
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 text-faint">
-        <TableProperties className="size-7 opacity-40" strokeWidth={1.5} />
-        <p className="text-[12.5px]">Run a query or pick a table.</p>
+        <TableProperties
+          className={cn("size-7 opacity-40", busy && "animate-pulse text-amber opacity-70")}
+          strokeWidth={1.5}
+        />
+        <p className={cn("text-[12.5px]", busy && "animate-pulse")}>
+          {busy ? "running query\u2026" : "Run a query or pick a table."}
+        </p>
       </div>
     );
   }
@@ -183,7 +195,12 @@ export default function DataGrid({
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
-      <div className="min-h-0 min-w-0 flex-1 overflow-auto">
+      <div
+        className={cn(
+          "min-h-0 min-w-0 flex-1 overflow-auto transition-opacity duration-200",
+          busy && "pointer-events-none opacity-50",
+        )}
+      >
       <table
         className="grid-table font-mono text-[12.5px]"
         style={{ width: totalWidth }}
