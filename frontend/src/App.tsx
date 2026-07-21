@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, RefreshCw, Save, Trash2, X } from "lucide-react";
+import CommitPanel from "@/components/CommitPanel";
 import Connections from "@/components/Connections";
 import DataGrid from "@/components/DataGrid";
 import QueryBuilder from "@/components/QueryBuilder";
@@ -74,6 +75,9 @@ export default function App() {
   // Lives here, not in Editor: moving to a table tab unmounts the editor, and
   // coming back should not throw away the size you chose.
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_HEIGHT);
+  // Whether the staged-edits review panel is open. App-level because it and
+  // the row inspector share the grid's right edge — only one shows at a time.
+  const [showCommit, setShowCommit] = useState(false);
 
   /// Queries can overlap — opening a restored workspace starts the catalog
   /// load and the active tab's first run together — so busy is a count, not
@@ -193,6 +197,28 @@ export default function App() {
     }
     setTables(parseTables(result.out));
   }, [run]);
+
+  // The review panel only has a reason to exist while there are edits to
+  // review — an empty batch (committed, discarded, or all removed) closes it.
+  const stagedLen = tab.staged.length;
+  useEffect(() => {
+    if (stagedLen === 0) setShowCommit(false);
+  }, [stagedLen]);
+
+  // Escape closes the review panel, but not while a value field owns the
+  // keypress — that Escape abandons the field's draft (it stops propagation),
+  // and the same rule keeps a grid cell editor's Escape from closing it too.
+  useEffect(() => {
+    if (!showCommit) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      const el = document.activeElement;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+      setShowCommit(false);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showCommit]);
 
   // Each connection owns a whole workspace: switching saves the outgoing one
   // under the connection it describes and loads the incoming one. Tabs never
@@ -765,6 +791,14 @@ export default function App() {
             <span className="flex-1" />
             <Button
               size="sm"
+              variant={showCommit ? "secondary" : "ghost"}
+              onClick={() => setShowCommit((open) => !open)}
+              aria-pressed={showCommit}
+            >
+              {showCommit ? "Hide" : "Review"}
+            </Button>
+            <Button
+              size="sm"
               variant="ghost"
               onClick={() => patchTab({ staged: [] })}
               disabled={busy}
@@ -781,16 +815,30 @@ export default function App() {
             present so nothing shifts when a query starts. */}
         <div className={cn("h-[2px] flex-none", busy && "loading-strip")} aria-hidden />
 
-        <DataGrid
-          page={tab.page}
-          keyed={tab.source.kind === "table"}
-          staged={stagedMap}
-          editable={tab.source.kind === "table"}
-          onStage={stageEdit}
-          sort={tab.source.kind === "table" ? tab.source.query.sort : []}
-          onSort={tab.source.kind === "table" ? toggleSort : undefined}
-          busy={busy}
-        />
+        <div className="flex min-h-0 flex-1">
+          <DataGrid
+            page={tab.page}
+            keyed={tab.source.kind === "table"}
+            staged={stagedMap}
+            editable={tab.source.kind === "table"}
+            onStage={stageEdit}
+            sort={tab.source.kind === "table" ? tab.source.query.sort : []}
+            onSort={tab.source.kind === "table" ? toggleSort : undefined}
+            busy={busy}
+            suppressInspector={showCommit}
+            onRowClick={() => setShowCommit(false)}
+          />
+
+          {showCommit && tab.source.kind === "table" && tab.staged.length > 0 && (
+            <CommitPanel
+              edits={tab.staged}
+              page={tab.page}
+              busy={busy}
+              onStage={stageEdit}
+              onClose={() => setShowCommit(false)}
+            />
+          )}
+        </div>
 
         <footer className="flex h-7 flex-none items-center gap-3 border-t border-border bg-card px-3 font-mono text-[11px] text-muted-foreground">
           <span

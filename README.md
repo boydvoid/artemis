@@ -229,7 +229,11 @@ CDN-loaded — the WebView may be offline.
 
 Double-click a cell in a table view to edit it; Enter stages, Escape
 cancels. Staged cells show amber until committed — nothing reaches the
-database before **Commit**.
+database before **Commit**. The staged banner's **Review** opens a
+right-side panel listing every pending edit grouped by row, each showing
+the database value → an editable field, with a control to remove it (which
+is just staging the original value back). It shares the right edge with the
+row inspector — opening one closes the other.
 
 Commit sends one transaction: all edits to a row collapse into a single
 UPDATE, so a multi-column change lands together. Rows are addressed by

@@ -55,6 +55,13 @@ interface Props {
   /// the OLD result, and pretending otherwise would invite edits against
   /// rows about to be replaced (interaction is disabled while dimmed).
   busy?: boolean;
+  /// The right edge is shared with the commit panel: when it owns that space
+  /// the inspector is hidden and its selection cleared, so closing the commit
+  /// panel does not pop a stale inspector back open.
+  suppressInspector?: boolean;
+  /// A row was clicked. App uses it to yield the right edge back to the
+  /// inspector by closing the commit panel.
+  onRowClick?: () => void;
 }
 
 /// A first-pass width from the widest sample in the column, clamped. Cheap
@@ -81,6 +88,8 @@ export default function DataGrid({
   sort = [],
   onSort,
   busy = false,
+  suppressInspector = false,
+  onRowClick,
 }: Props) {
   const [widths, setWidths] = useState<Record<string, number>>({});
   const [editing, setEditing] = useState<{ r: number; c: number } | null>(null);
@@ -108,6 +117,12 @@ export default function DataGrid({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [editing]);
+
+  // The commit panel took the right edge: drop the inspector selection so it
+  // does not reappear when the commit panel closes.
+  useEffect(() => {
+    if (suppressInspector) setSelected(null);
+  }, [suppressInspector]);
 
   const resolved = useMemo(
     () => page.cols.map((col, i) => widths[col] ?? autoWidth(col, page.rows, i)),
@@ -190,8 +205,10 @@ export default function DataGrid({
   }
 
   const totalWidth = resolved.reduce((sum, w) => sum + w, 0);
-  // The selected index can outlive its row when a smaller page arrives.
-  const inspected = selected !== null && selected < page.rows.length ? selected : null;
+  // The selected index can outlive its row when a smaller page arrives, and
+  // the commit panel hides the inspector while it owns the right edge.
+  const inspected =
+    !suppressInspector && selected !== null && selected < page.rows.length ? selected : null;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
@@ -269,7 +286,10 @@ export default function DataGrid({
             <tr
               key={page.keys[r] ?? r}
               className={cn("group", inspected === r && "row-inspected")}
-              onClick={() => setSelected(r)}
+              onClick={() => {
+                setSelected(r);
+                onRowClick?.();
+              }}
             >
               <td
                 className="grid-gutter text-[11px] text-faint group-hover:text-amber"
