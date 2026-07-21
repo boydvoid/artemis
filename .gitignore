@@ -1,0 +1,17 @@
+# Build output
+zig-out/
+.zig-cache/
+.native/
+frontend/dist/
+node_modules/
+
+# The app's own store: saved connections and saved queries.
+# Connection strings are kept in plain text, so this must never be committed.
+.artemis/
+*.db
+
+# Local machine config (contains absolute paths)
+.claude/settings.local.json
+
+# OS
+.DS_Store

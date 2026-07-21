@@ -1,0 +1,192 @@
+/* Artemis — engineering-instrument aesthetic on shadcn/Tailwind.
+   Near-black ground, hairline rules, one phosphor-amber accent carrying
+   every signal. The data plane is monospace end to end so columns align
+   optically as well as geometrically.
+
+   The app is dark-only by design (a tool you stare at for hours), so the
+   dark values live in :root and .dark alike rather than behind a toggle. */
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-heading: var(--font-sans);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Signal colours the app reasons about directly. */
+  --color-amber: var(--amber);
+  --color-hairline: var(--hairline);
+  --color-faint: var(--faint);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+
+  /* One data row. Density is the aesthetic: this is the number to change
+     if the grid ever needs to breathe. */
+  --spacing-row: 27px;
+}
+
+:root,
+.dark {
+  --background: #0b0c0d;
+  --foreground: #dfe3e6;
+  --card: #101214;
+  --card-foreground: #dfe3e6;
+  --popover: #16191c;
+  --popover-foreground: #dfe3e6;
+
+  /* Amber is the only saturated colour in the app; it means "this is the
+     live one" — active connection, staged edit, primary action. */
+  --primary: #ffb000;
+  --primary-foreground: #17130a;
+
+  --secondary: #16191c;
+  --secondary-foreground: #dfe3e6;
+  --muted: #16191c;
+  --muted-foreground: #7d868c;
+  --accent: #1a1d20;
+  --accent-foreground: #dfe3e6;
+  --destructive: #ff5f56;
+
+  --border: #232729;
+  --input: #232729;
+  --ring: #7a5600;
+
+  --amber: #ffb000;
+  --hairline: #1a1d20;
+  --faint: #4c5459;
+
+  --radius: 0.375rem;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-size: 13px;
+    /* The grid owns all scrolling; the shell itself never moves. */
+    overflow: hidden;
+  }
+
+  /* While dragging a column divider the pointer should not flicker back to
+     a text caret over cell text. */
+  body.resizing {
+    cursor: col-resize;
+    user-select: none;
+  }
+}
+
+@layer components {
+  /* The grid is a hand-built table rather than a shadcn one: sticky header,
+     sticky row gutter, fixed layout and drag-resizable columns are all
+     things the stock Table component does not do. These few rules carry
+     what utility classes cannot express cleanly. */
+  .grid-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
+  }
+
+  .grid-table th,
+  .grid-table td {
+    height: var(--spacing-row);
+    padding: 0 9px;
+    border-right: 1px solid var(--hairline);
+    border-bottom: 1px solid var(--hairline);
+    text-align: left;
+    font-weight: 400;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .grid-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--popover);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Pinned left so the row number survives horizontal scrolling; the header
+     cell sits above both so the top-left corner never shows content
+     sliding under it. */
+  .grid-gutter {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    width: 46px;
+    min-width: 46px;
+    background: var(--card);
+    border-right: 1px solid var(--border);
+    text-align: right;
+    user-select: none;
+  }
+
+  .grid-table thead .grid-gutter {
+    z-index: 4;
+    background: var(--popover);
+  }
+
+  /* Revealed on header hover only — 26 columns should not read as 26
+     handles. */
+  .col-resize {
+    position: absolute;
+    top: 0;
+    right: -3px;
+    width: 7px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 3;
+  }
+
+  .grid-table thead th:hover .col-resize::after {
+    content: "";
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    left: 3px;
+    width: 1px;
+    background: var(--amber);
+  }
+}

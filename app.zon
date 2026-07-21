@@ -1,0 +1,36 @@
+.{
+    .id = "dev.native_sdk.artemis",
+    .name = "artemis",
+    .display_name = "Artemis",
+    .version = "0.1.0",
+    .icons = .{ "assets/icon.png" },
+    .platforms = .{ "macos", "linux" },
+    .permissions = .{},
+    .capabilities = .{ "webview" },
+    .frontend = .{
+        .dist = "frontend/dist",
+        .entry = "index.html",
+        // Port 5199, not Vite's default 5173: `native dev` waits for this
+        // URL to answer, so another project's dev server sitting on 5173
+        // would read as "ready" and the shell would load ITS app. Keep this
+        // in lockstep with frontend/vite.config.js, which pins the same
+        // port with strictPort.
+        .dev = .{
+            .url = "http://127.0.0.1:5199/",
+            .command = .{ "npm", "--prefix", "frontend", "run", "dev" },
+            .ready_path = "/",
+            .timeout_ms = 30000,
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "zero://app", "zero://inline", "http://127.0.0.1:5199" },
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    .windows = .{
+        .{ .label = "main", .title = "Artemis", .width = 1280, .height = 800, .restore_state = true },
+    },
+}

@@ -1,0 +1,3 @@
+<template name="header-cell" args="value">
+  <text height="30" padding="6" background="surface_subtle" foreground="text_muted">{value}</text>
+</template>

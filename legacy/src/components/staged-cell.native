@@ -1,0 +1,3 @@
+<template name="staged-cell" args="value code">
+  <text height="28" padding="6" foreground="warning" on-press="begin_edit:{code}">{value}</text>
+</template>

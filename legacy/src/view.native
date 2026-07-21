@@ -1,0 +1,443 @@
+<!-- Grid cell components: each template owns one cell's shape, stamped
+     once per cell by the grid's flat cell loop. A cell's position rides
+     `code` as the single `begin_edit` payload, so any number of columns
+     shares these three definitions. -->
+<import src="components/header-cell.native"/>
+<import src="components/data-cell.native"/>
+<import src="components/staged-cell.native"/>
+
+<column grow="1" background="background">
+
+  <!-- Shell error fallback: runtime/app errors surface here, never silently. -->
+  <if test="{hasError}">
+    <alert text="Something went wrong">
+      <column gap="10" padding="12">
+        <row gap="8" cross="center">
+          <icon name="alert" foreground="destructive" />
+          <text wrap="true" grow="1">{shell_error}</text>
+        </row>
+        <row>
+          <button size="sm" variant="outline" icon="x" on-press="clear_error">Dismiss</button>
+        </row>
+      </column>
+    </alert>
+  </if>
+
+  <row grow="1">
+
+    <!-- Persistent navigation -->
+    <if test="{sidebar_open}">
+      <column width="200" background="surface" padding="12" gap="2" label="Sidebar">
+        <row cross="center" gap="8" padding="4">
+          <icon name="circle-dot" foreground="accent" />
+          <text><span weight="bold">Artemis</span></text>
+          <spacer grow="1" />
+          <button variant="ghost" size="sm" icon="{chevronIcon}" on-press="toggle_sidebar"
+            label="Collapse sidebar"></button>
+        </row>
+        <spacer height="8" />
+        <list-item icon="archive" selected="{section == 'connection'}"
+          on-press="select_connection">Connections</list-item>
+        <list-item icon="terminal" selected="{section == 'query'}" on-press="select_query">Query</list-item>
+        <spacer grow="1" />
+        <separator />
+        <if test="{hasActive}">
+          <row gap="6" cross="center" padding="4">
+            <icon name="check-circle" foreground="success" />
+            <text foreground="text_muted">{activeName}</text>
+          </row>
+        </if>
+        <else>
+          <row gap="6" cross="center" padding="4">
+            <icon name="circle-dot" foreground="text_muted" />
+            <text foreground="text_muted">Not connected</text>
+          </row>
+        </else>
+      </column>
+      <separator />
+    </if>
+
+    <!-- Primary workspace -->
+    <column grow="1" gap="12" padding="16">
+      <if test="{not sidebar_open}">
+        <row>
+          <button variant="ghost" size="sm" icon="{chevronIcon}" on-press="toggle_sidebar"
+            label="Expand sidebar"></button>
+        </row>
+      </if>
+
+      <if test="{section == 'connection'}">
+        <column grow="1" gap="12">
+          <text size="heading">Connections</text>
+          <text foreground="text_muted" wrap="true">Saved locally in SQLite. Press a connection to make it the query
+            target.</text>
+
+          <scroll grow="1">
+            <column gap="8">
+              <for each="connections" key="id" as="c">
+                <row gap="12" cross="center" background="surface_subtle" radius="md" padding="12"
+                  on-press="activate_connection:{c.id}" label="{c.name}">
+                  <if test="{c.id == active_id}">
+                    <icon name="check-circle" foreground="success" />
+                  </if>
+                  <else>
+                    <icon name="circle-dot" foreground="text_muted" />
+                  </else>
+                  <column grow="1" gap="3">
+                    <text><span weight="medium">{c.name}</span></text>
+                    <text foreground="text_muted">{c.url}</text>
+                  </column>
+                  <button variant="ghost" size="sm" icon="edit" on-press="edit_connection:{c.id}"
+                    label="Edit connection"></button>
+                  <button variant="ghost" size="sm" icon="trash" on-press="delete_connection:{c.id}"
+                    label="Delete connection"></button>
+                </row>
+              </for>
+              <else>
+                <column gap="10" cross="center" padding="24">
+                  <icon name="archive" width="28" height="28" foreground="text_muted" />
+                  <text foreground="text_muted">No saved connections yet</text>
+                  <text foreground="text_muted">Add one below to get started.</text>
+                </column>
+              </else>
+            </column>
+          </scroll>
+
+          <separator />
+          <column gap="10" background="surface_subtle" radius="md" padding="14">
+            <if test="{isEditing}">
+              <text foreground="text_muted">EDIT CONNECTION</text>
+            </if>
+            <else>
+              <text foreground="text_muted">ADD A CONNECTION</text>
+            </else>
+            <row gap="8">
+              <text-field text="{nameDraft}" placeholder="Local dev" on-input="name_edit" width="200"
+                label="Connection name" />
+              <text-field text="{urlDraft}" placeholder="postgres://user:password@localhost:5432/postgres"
+                on-input="url_edit" on-submit="save_connection" grow="1" label="Connection string" />
+            </row>
+            <row gap="8" cross="center">
+              <if test="{isEditing}">
+                <button variant="primary" icon="save" on-press="save_connection">Update</button>
+                <button variant="outline" icon="x" on-press="new_connection">Cancel</button>
+              </if>
+              <else>
+                <button variant="primary" icon="plus" on-press="save_connection">Add connection</button>
+              </else>
+              <if test="{db_busy}">
+                <spinner />
+              </if>
+            </row>
+          </column>
+        </column>
+      </if>
+      <else>
+        <column grow="1" gap="12">
+          <if test="{hasActive}">
+            <row cross="center" gap="10">
+              <text size="heading">{activeName}</text>
+              <if test="{tables_busy}">
+                <spinner />
+              </if>
+              <spacer grow="1" />
+              <button variant="ghost" size="sm" icon="refresh-cw" on-press="reload_tables"
+                label="Reload tables"></button>
+            </row>
+            <row grow="1" gap="14">
+
+              <!-- Database browser: schemas and their tables -->
+              <column width="210" gap="4" label="Database browser">
+                <scroll grow="1">
+                  <column gap="2">
+                    <for each="browserRows" key="key" as="b">
+                      <if test="{b.header}">
+                        <text foreground="text_muted" padding="4">{b.label}</text>
+                      </if>
+                      <else>
+                        <list-item size="sm" icon="file-text" selected="{b.id == activeTableId}"
+                          on-press="select_table:{b.id}">{b.label}</list-item>
+                      </else>
+                    </for>
+                    <else>
+                      <text foreground="text_muted" wrap="true" padding="4">No tables found in this database.</text>
+                    </else>
+                    <spacer height="10" />
+                    <text foreground="text_muted" padding="4">SAVED QUERIES</text>
+                    <for each="saved_queries" key="id" as="q">
+                      <row gap="4" cross="center" radius="sm" padding="2" on-press="load_saved:{q.id}" label="{q.name}">
+                        <icon name="save" foreground="text_muted" />
+                        <text grow="1">{q.name}</text>
+                        <button variant="ghost" size="sm" icon="trash" on-press="delete_saved:{q.id}"
+                          label="Delete saved query"></button>
+                      </row>
+                    </for>
+                    <else>
+                      <text foreground="text_muted" padding="4">Nothing saved yet</text>
+                    </else>
+                  </column>
+                </scroll>
+              </column>
+              <separator />
+
+              <!-- Query tabs: per-tab editor + results -->
+              <column grow="1" gap="10">
+                <row gap="2" cross="center" label="Query tabs">
+                  <for each="tabs" key="id" as="t">
+                    <toggle-button size="sm" icon="{t.icon}" selected="{t.id == active_tab_id}"
+                      on-toggle="select_tab:{t.id}">{t.title}</toggle-button>
+                    <button variant="ghost" size="sm" icon="x" on-press="close_tab:{t.id}" label="Close tab"></button>
+                    <spacer width="4" />
+                  </for>
+                  <button variant="ghost" size="sm" icon="plus" on-press="new_tab" disabled="{not canAddTab}"
+                    label="New query tab"></button>
+                  <spacer grow="1" />
+                </row>
+
+                <if test="{not browsingTable}">
+                  <input-group label="SQL editor">
+                    <textarea text="{activeEditor}" placeholder="SELECT * FROM ..." on-input="editor_edit"
+                      on-submit="run_query" height="104" label="SQL editor" />
+                    <input-group-actions gap="8">
+                      <button variant="primary" size="sm" icon="play" on-press="run_query"
+                        disabled="{not canRun}">Run</button>
+                      <if test="{anyRunning}">
+                        <button variant="outline" size="sm" icon="x" on-press="stop_query">Stop</button>
+                      </if>
+                      <if test="{activeRunning}">
+                        <spinner />
+                      </if>
+                      <button variant="ghost" size="sm" icon="save" on-press="open_save_query"
+                        label="Save query">Save</button>
+                      <spacer grow="1" />
+                      <if test="{paged}">
+                        <button variant="ghost" size="sm" icon="chevron-left" on-press="prev_page"
+                          disabled="{not canPrev}" label="Previous page"></button>
+                        <text foreground="text_muted">{pageStart}-{pageEnd}</text>
+                        <button variant="ghost" size="sm" icon="chevron-right" on-press="next_page"
+                          disabled="{not canNext}" label="Next page"></button>
+                      </if>
+                    </input-group-actions>
+                  </input-group>
+                </if>
+
+                <if test="{browsingTable}">
+                  <row gap="8" cross="center">
+                    <text foreground="text_muted" grow="1">{activeEditor}</text>
+                    <if test="{activeRunning}">
+                      <spinner />
+                    </if>
+                    <button variant="ghost" size="sm" icon="chevron-left" on-press="prev_page" disabled="{not canPrev}"
+                      label="Previous page"></button>
+                    <text foreground="text_muted">{pageStart}-{pageEnd}</text>
+                    <button variant="ghost" size="sm" icon="chevron-right" on-press="next_page" disabled="{not canNext}"
+                      label="Next page"></button>
+                  </row>
+                  <if test="{hasStaged}">
+                    <row gap="8" cross="center" background="surface_subtle" radius="sm" padding="6"
+                      label="Staged changes">
+                      <icon name="edit" foreground="warning" />
+                      <text>{stagedCount} staged {plural(stagedCount, 'change', 'changes')}</text>
+                      <button variant="outline" size="sm" icon="eye" on-press="open_review">Review</button>
+                      <button variant="primary" size="sm" icon="check" on-press="commit_staged"
+                        disabled="{not canRun}">Commit</button>
+                      <button variant="ghost" size="sm" icon="trash" on-press="discard_staged">Discard</button>
+                      <spacer grow="1" />
+                    </row>
+                  </if>
+                  <if test="{commit_ok}">
+                    <row gap="6" cross="center">
+                      <icon name="check-circle" foreground="success" />
+                      <text foreground="success">Changes committed.</text>
+                    </row>
+                  </if>
+                  <row gap="6" cross="center" label="Query builder">
+                    <stack>
+                      <select size="sm" width="150" placeholder="Column" on-press="toggle_filter_column"
+                        label="Filter column">{filterColumn}</select>
+                      <if test="{filter_column_open}">
+                        <dropdown-menu anchor="below" anchor-alignment="stretch" on-dismiss="dismiss_filter_column">
+                          <for each="activeColumns" key="name" as="col">
+                            <menu-item on-press="pick_filter_column:{col.name}">{col.name}</menu-item>
+                          </for>
+                        </dropdown-menu>
+                      </if>
+                    </stack>
+                    <stack>
+                      <select size="sm" width="120" placeholder="Operator" on-press="toggle_filter_op"
+                        label="Filter operator">{filterOpText}</select>
+                      <if test="{filter_op_open}">
+                        <dropdown-menu anchor="below" anchor-alignment="stretch" on-dismiss="dismiss_filter_op">
+                          <for each="filterOps" key="op" as="o">
+                            <menu-item on-press="pick_filter_op:{o.op}">{o.label}</menu-item>
+                          </for>
+                        </dropdown-menu>
+                      </if>
+                    </stack>
+                    <text-field size="sm" width="170" text="{filterValue}" placeholder="Value"
+                      on-input="filter_value_edit" on-submit="add_filter" label="Filter value" />
+                    <button variant="outline" size="sm" icon="plus" on-press="add_filter">Filter</button>
+                    <spacer grow="1" />
+                  </row>
+                  <if test="{hasFilters}">
+                    <row gap="6" cross="center" label="Applied filters">
+                      <for each="activeFilters" key="id" as="f">
+                        <row gap="2" cross="center" background="surface_subtle" radius="sm" padding="4">
+                          <icon name="search" foreground="text_muted" />
+                          <text>{f.label}</text>
+                          <button variant="ghost" size="sm" icon="x" on-press="remove_filter:{f.id}"
+                            label="Remove filter"></button>
+                        </row>
+                      </for>
+                      <button variant="ghost" size="sm" on-press="clear_filters">Clear all</button>
+                      <spacer grow="1" />
+                    </row>
+                  </if>
+                </if>
+
+                <if test="{hasResult}">
+                  <if test="{gridEmpty}">
+                    <column gap="10" cross="center" padding="24" grow="1">
+                      <icon name="search" width="28" height="28" foreground="text_muted" />
+                      <text foreground="text_muted">No rows returned</text>
+                    </column>
+                  </if>
+                  <else>
+                    <column grow="1" label="Data grid">
+                      <if test="{editingCell}">
+                        <row gap="8" cross="center" background="surface_subtle" radius="sm" padding="6"
+                          label="Cell edit bar">
+                          <icon name="edit" foreground="text_muted" />
+                          <text foreground="text_muted">{editingColumn}</text>
+                          <text-field size="sm" grow="1" text="{cellDraft}" on-input="cell_edit" on-submit="stage_edit"
+                            autofocus="true" label="Cell editor" />
+                          <button variant="primary" size="sm" icon="check" on-press="stage_edit">Stage</button>
+                          <button variant="ghost" size="sm" icon="x" on-press="cancel_edit"
+                            label="Cancel edit"></button>
+                        </row>
+                      </if>
+                        <table width="420" grow="1">
+  <table-row>
+    <table-cell grow="1" size="sm" foreground="text_muted">Invoice</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted">Status</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+    <table-cell grow="1" size="sm" foreground="text_muted" text-alignment="end">Amount</table-cell>
+  </table-row>
+    <table-row>
+      <table-cell grow="1">1</table-cell>
+      <table-cell grow="1">2</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+      <table-cell grow="1" text-alignment="end">3</table-cell>
+    </table-row>
+</table>
+                      <scroll grow="1">
+                        <column>
+                          <grid columns="{activeColCount}" label="Results">
+                            <for each="activeColumns" as="col">
+                              <use template="header-cell" value="{col.name}" />
+                            </for>
+                            <for each="activeCells" as="cell">
+                              <if test="{cell.dirty}">
+                                <use template="staged-cell" value="{cell.text}" code="{cell.code}" />
+                              </if>
+                              <else>
+                                <use template="data-cell" value="{cell.text}" code="{cell.code}" />
+                              </else>
+                            </for>
+                          </grid>
+                          <spacer grow="1" />
+                        </column>
+                      </scroll>
+                    </column>
+                  </else>
+                </if>
+                <else>
+                  <column gap="10" cross="center" main="center" padding="24" grow="1">
+                    <icon name="terminal" width="28" height="28" foreground="text_muted" />
+                    <text foreground="text_muted">Run a query or select a table to see results</text>
+                  </column>
+                </else>
+              </column>
+            </row>
+
+            <!-- Staged-changes review: old -> new per cell, unstage per line -->
+            <if test="{review_open}">
+              <dialog text="Staged changes" on-dismiss="close_review">
+                <column gap="10">
+                  <for each="activeStaged" key="id" as="s">
+                    <row gap="6" cross="center">
+                      <icon name="edit" foreground="warning" />
+                      <text grow="1">{s.label}</text>
+                      <button variant="ghost" size="sm" icon="x" on-press="unstage:{s.id}"
+                        label="Unstage change"></button>
+                    </row>
+                  </for>
+                  <row gap="8">
+                    <button variant="primary" icon="check" on-press="commit_staged">Commit all</button>
+                    <button variant="outline" icon="x" on-press="close_review">Close</button>
+                  </row>
+                </column>
+              </dialog>
+            </if>
+
+            <!-- Save-query dialog: name it, it lands in local SQLite -->
+            <if test="{save_query_open}">
+              <dialog text="Save query" on-dismiss="cancel_save_query">
+                <column gap="12">
+                  <text-field text="{saveName}" placeholder="Query name" on-input="save_name_edit"
+                    on-submit="confirm_save_query" label="Query name" autofocus="true" width="280" />
+                  <row gap="8">
+                    <button variant="primary" icon="save" on-press="confirm_save_query">Save</button>
+                    <button variant="outline" icon="x" on-press="cancel_save_query">Cancel</button>
+                  </row>
+                </column>
+              </dialog>
+            </if>
+
+            <!-- Close-tab confirmation: unsaved query text never closes silently -->
+            <if test="{closingTab}">
+              <dialog text="Close tab?" on-dismiss="cancel_close_tab">
+                <column gap="12">
+                  <text wrap="true">This tab has unsaved query text. Close it anyway?</text>
+                  <row gap="8">
+                    <button variant="destructive" icon="trash" on-press="confirm_close_tab">Close tab</button>
+                    <button variant="outline" icon="x" on-press="cancel_close_tab">Keep editing</button>
+                  </row>
+                </column>
+              </dialog>
+            </if>
+          </if>
+          <else>
+            <column gap="12" cross="center" main="center" grow="1">
+              <icon name="circle-dot" width="32" height="32" foreground="text_muted" />
+              <text size="heading">Not connected</text>
+              <text foreground="text_muted">Choose a connection to start browsing and querying.</text>
+              <button variant="primary" icon="archive" on-press="select_connection">Go to Connections</button>
+            </column>
+          </else>
+        </column>
+      </else>
+    </column>
+  </row>
+
+  <if test="{hasActive}">
+    <status-bar>{connectionCount} saved {plural(connectionCount, 'connection', 'connections')} | connected to
+      {activeName}</status-bar>
+  </if>
+  <else>
+    <status-bar>{connectionCount} saved {plural(connectionCount, 'connection', 'connections')} | not
+      connected</status-bar>
+  </else>
+</column>
