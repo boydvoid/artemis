@@ -75,10 +75,11 @@ Override with `ARTEMIS_DB=/path/to/file`.
 file lives outside the repo and is gitignored, but treat it like any other
 credential store.
 
-The workspace session (open tabs, filters, sort, page sizes) lives
-separately in the WebView's localStorage under `artemis:session`. It holds
-no credentials and no query results; clearing the WebView's data resets
-the workspace but touches nothing in SQLite.
+Workspace sessions (open tabs, filters, sort, page sizes) live separately
+in the WebView's localStorage, one entry per connection under
+`artemis:session:<id>`; deleting a connection deletes its session. They
+hold no credentials and no query results; clearing the WebView's data
+resets the workspaces but touches nothing in SQLite.
 
 ## Architecture
 
@@ -186,13 +187,16 @@ browser. The rail header shows the active connection and is the way back
 home. Switching to a *different* connection clears sources and results but
 keeps statement text and page-size preferences.
 
-**Reopening the app restores the last session** — the workspace, its tabs,
-their filters, hidden columns, sort and page sizes — provided the session
-belongs to the remembered connection. The active tab re-runs on open;
-others re-run when you switch to them. Results and staged edits are never
-restored: a cached page presented as current is worse than an empty grid,
-and a staged edit committed after a restart could overwrite someone else's
-change. With no session to restore, launching lands on Home.
+**Every connection remembers its own workspace** — tabs, filters, hidden
+columns, sort and page sizes. Reopening the app restores the remembered
+connection's workspace, and switching connections swaps whole workspaces:
+the outgoing one is saved, the incoming one restored, so tabs never bleed
+between databases and nothing typed is lost — it waits in the connection it
+belongs to. The active tab re-runs when you land on it; others re-run when
+you switch to them. Results and staged edits are never restored: a cached
+page presented as current is worse than an empty grid, and a staged edit
+committed after a restart could overwrite someone else's change. With no
+session to restore, launching lands on Home.
 
 ## Working
 

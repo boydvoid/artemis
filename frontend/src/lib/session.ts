@@ -21,7 +21,17 @@
 import { freshTab, type QueryTab } from "./tabs";
 import { reserveNodeIds } from "./sql";
 
-const KEY = "artemis:session";
+/// One session per connection: a workspace describes tables in one specific
+/// database, so each connection remembers its own and switching swaps whole
+/// workspaces rather than bleeding tabs between databases.
+function keyFor(connectionId: number): string {
+  return `artemis:session:${connectionId}`;
+}
+
+/// The pre-per-connection slot. It holds exactly the cross-connection soup
+/// this design replaces, so it is deleted on sight rather than migrated.
+const LEGACY_KEY = "artemis:session";
+
 /// Bumped when the shape below changes incompatibly. A mismatch drops the
 /// session rather than trying to migrate half-understood data into the app.
 const VERSION = 1;
@@ -43,20 +53,27 @@ export interface Session {
 }
 
 export function saveSession(session: Session): void {
+  if (session.connectionId <= 0) return;
   try {
-    window.localStorage.setItem(KEY, JSON.stringify(session));
+    window.localStorage.removeItem(LEGACY_KEY);
+    window.localStorage.setItem(keyFor(session.connectionId), JSON.stringify(session));
   } catch {
     // Full, or storage disabled. A lost session is not worth an error in the
     // user's face — they just get a fresh workspace next time.
   }
 }
 
-export function loadSession(): Session | null {
+export function loadSession(connectionId: number): Session | null {
+  if (connectionId <= 0) return null;
   try {
-    const raw = window.localStorage.getItem(KEY);
+    window.localStorage.removeItem(LEGACY_KEY);
+    const raw = window.localStorage.getItem(keyFor(connectionId));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Session;
     if (parsed.version !== VERSION) return null;
+    // The key says which connection this is for; the field agreeing is the
+    // sanity check that nothing wrote through the wrong key.
+    if (parsed.connectionId !== connectionId) return null;
     if (!Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
     return parsed;
   } catch {
@@ -64,9 +81,11 @@ export function loadSession(): Session | null {
   }
 }
 
-export function clearSession(): void {
+/// Forget one connection's workspace — called when the connection itself is
+/// deleted, so orphaned sessions do not accumulate in localStorage.
+export function clearSession(connectionId: number): void {
   try {
-    window.localStorage.removeItem(KEY);
+    window.localStorage.removeItem(keyFor(connectionId));
   } catch {
     // Nothing to do; the next save overwrites it anyway.
   }

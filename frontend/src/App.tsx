@@ -31,7 +31,7 @@ import {
   type SavedQuery,
 } from "@/lib/store";
 import { editText, parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
-import { hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
+import { clearSession, hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
 import {
   DEFAULT_PAGE_SIZE,
   PAGE_SIZES,
@@ -79,9 +79,14 @@ export default function App() {
   const [error, setError] = useState("");
 
   /// Session restore bookkeeping. `booted` gates saving so the empty first
-  /// render cannot overwrite the session we are about to load.
+  /// render cannot overwrite the session we are about to load; `bootLoadedRef`
+  /// names the connection whose workspace boot hydrated, so the switch effect
+  /// does not immediately re-hydrate (or clobber) it; `prevConnectionRef` is
+  /// the connection the CURRENT tabs describe, which is where they must be
+  /// saved when a switch replaces them.
   const [booted, setBooted] = useState(false);
-  const connectionSeenRef = useRef(false);
+  const bootLoadedRef = useRef(0);
+  const prevConnectionRef = useRef(0);
 
   const active = useMemo(
     () => connections.find((c) => c.id === activeId) ?? null,
@@ -121,16 +126,16 @@ export default function App() {
         const known = rows.some((c) => c.id === activeConn);
         if (known) setActiveId(activeConn);
 
-        // Restore the workspace only for the connection it was built against.
-        // The tabs name tables in one specific database; against another they
-        // would be a list of things that may not exist.
-        const session = loadSession();
-        if (known && session && session.connectionId === activeConn) {
+        // Restore the remembered connection's own workspace. Sessions are
+        // per connection — the tabs name tables in one specific database.
+        const session = known ? loadSession(activeConn) : null;
+        if (session) {
           setTabs(session.tabs.map(hydrateTab));
           setActiveTabId(session.activeTabId);
           setNextTabId(session.nextTabId);
           setEditorHeight(session.editorHeight);
           setScreen(session.screen);
+          bootLoadedRef.current = activeConn;
         }
       } catch (storeError) {
         if (!cancelled) {
@@ -184,31 +189,56 @@ export default function App() {
     setTables(parseTables(result.out));
   }, [run]);
 
-  // Changing connection resets every tab: their results describe a database
-  // that is no longer selected. The statement text is kept — that is the
-  // user's writing, not the database's data.
+  // Each connection owns a whole workspace: switching saves the outgoing one
+  // under the connection it describes and loads the incoming one. Tabs never
+  // carry across — a tab naming another database's table is noise here, and
+  // nothing typed is lost, because it is waiting in the workspace it belongs
+  // to. This replaces the old behavior of keeping statement text through a
+  // switch, which per-connection persistence turned from convenience into
+  // cross-contamination.
   useEffect(() => {
+    const prev = prevConnectionRef.current;
+    prevConnectionRef.current = activeId;
     if (!active) {
       setTables([]);
       return;
     }
-    // The first connection of a session is not a switch — it is either the one
-    // restored from the session or the one just picked on the home screen, and
-    // in both cases the tabs already describe it. Resetting here would throw
-    // away the very workspace boot just restored.
-    if (connectionSeenRef.current) {
-      setTabs((prev) =>
-        // Page size is a view preference like the statement text, not data that
-        // belonged to the old database — both survive the switch.
-        prev.map((t) => ({
-          ...freshTab(t.id, t.name),
-          sql: t.sql,
-          savedId: t.savedId,
-          pageSize: t.pageSize,
-        })),
-      );
+
+    if (prev !== activeId) {
+      // The closure still holds the outgoing render's state; the debounced
+      // save may not have flushed, and it must never write these tabs under
+      // the incoming connection's key.
+      if (prev > 0) {
+        saveSession({
+          version: 1,
+          connectionId: prev,
+          screen,
+          tabs: tabs.map(storeTab),
+          activeTabId,
+          nextTabId,
+          editorHeight,
+        });
+      }
+
+      if (bootLoadedRef.current === activeId) {
+        // Boot hydrated this workspace moments ago; loading again would
+        // clobber the restore with a stale read.
+        bootLoadedRef.current = 0;
+      } else {
+        const session = loadSession(activeId);
+        if (session) {
+          setTabs(session.tabs.map(hydrateTab));
+          setActiveTabId(session.activeTabId);
+          setNextTabId(session.nextTabId);
+          setEditorHeight(session.editorHeight);
+        } else {
+          setTabs([freshTab(1)]);
+          setActiveTabId(1);
+          setNextTabId(2);
+        }
+      }
     }
-    connectionSeenRef.current = true;
+
     void loadTables();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
@@ -245,8 +275,11 @@ export default function App() {
   useEffect(() => {
     if (!active || tab.source.kind === "none" || tab.page.cols.length > 0) return;
     void goToPage(0);
+    // Keyed on the tab OBJECT, not its kind: switching connections swaps in a
+    // hydrated tab whose kind can equal the old one's, and that swap must
+    // still trigger the run. The guards above make every other change a no-op.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, activeTabId, tab.source.kind]);
+  }, [active, tab]);
 
   async function openTable(table: TableRef) {
     // Already open? Go to it. Clicking a table twice should not produce two
@@ -559,6 +592,8 @@ export default function App() {
   async function removeConnection(id: number) {
     try {
       setConnections(await storeDelete(id));
+      // The workspace belonged to the connection; without it, it is noise.
+      clearSession(id);
       if (id === activeId) {
         selectConnection(0);
         setScreen("home");
