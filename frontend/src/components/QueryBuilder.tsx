@@ -12,9 +12,15 @@
 // Edits are local until Apply. A builder that re-queried on every keystroke
 // would hammer the database while you are halfway through typing a value; the
 // live SQL preview is what gives feedback in the meantime.
+//
+// Visual language: everything quiet except the logic. Controls are flat
+// hairline wells on the panel background; amber is spent only on the
+// connectives (the words that change what the query means), the primary
+// action, and hover intent. A condition should read left-to-right like the
+// SQL it becomes, and a hidden column should look switched off, not shouted.
 
 import { useEffect, useState } from "react";
-import { Plus, X } from "lucide-react";
+import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -72,6 +78,14 @@ function appendTo(node: Predicate, groupId: string, child: Predicate): Predicate
   return { ...node, children: node.children.map((c) => appendTo(c, groupId, child)) };
 }
 
+/// Flat hairline well, shared by every control in a condition row so the row
+/// reads as one phrase rather than three unrelated widgets.
+const WELL =
+  "h-6 rounded-[4px] border-hairline bg-card px-1.5 font-mono text-[11px] " +
+  "hover:border-border dark:bg-card dark:hover:bg-card";
+
+const CHEVRON = "[&_svg:not([class*='size-'])]:size-3";
+
 export default function QueryBuilder(props: Props) {
   const { columns, query, busy, onApply, onEditAsSql, buildSql } = props;
 
@@ -95,7 +109,7 @@ export default function QueryBuilder(props: Props) {
 
   function renderCondition(node: Condition) {
     return (
-      <div key={node.id} className="flex items-center gap-1.5">
+      <div key={node.id} className="group/row flex items-center gap-1">
         <Select
           value={node.column}
           onValueChange={(next) =>
@@ -105,7 +119,7 @@ export default function QueryBuilder(props: Props) {
         >
           <SelectTrigger
             size="sm"
-            className="h-7 w-[150px] font-mono text-[11.5px]"
+            className={cn(WELL, CHEVRON, "w-[136px] text-foreground")}
             aria-label="Condition column"
           >
             <SelectValue placeholder="column" />
@@ -131,7 +145,7 @@ export default function QueryBuilder(props: Props) {
         >
           <SelectTrigger
             size="sm"
-            className="h-7 w-[120px] font-mono text-[11.5px]"
+            className={cn(WELL, CHEVRON, "w-[104px] text-muted-foreground")}
             aria-label="Condition operator"
           >
             {/* Base UI renders the raw value unless given a formatter, and
@@ -149,7 +163,7 @@ export default function QueryBuilder(props: Props) {
 
         {opTakesValue(node.op) && (
           <Input
-            className="h-7 w-[170px] font-mono text-[11.5px]"
+            className={cn(WELL, "w-[160px] text-foreground placeholder:text-faint")}
             value={node.value}
             onChange={(e) =>
               setWhere(replaceNode(draft.where, node.id, { ...node, value: e.target.value }))
@@ -161,8 +175,10 @@ export default function QueryBuilder(props: Props) {
           />
         )}
 
+        {/* Destructive affordances stay hidden until the row is under the
+            pointer — a tree full of × is a tree that looks deletable. */}
         <button
-          className="text-faint transition-colors hover:text-amber"
+          className="p-0.5 text-faint opacity-0 transition-opacity group-hover/row:opacity-100 hover:text-amber focus-visible:opacity-100"
           onClick={() => setWhere(removeNode(draft.where, node.id))}
           disabled={busy}
           aria-label="Remove condition"
@@ -174,82 +190,100 @@ export default function QueryBuilder(props: Props) {
   }
 
   function renderGroup(node: Group, depth: number, root: boolean) {
+    // A connective binds two things; with fewer it is noise. The root earns
+    // its chip only then. A nested group keeps it always — the group exists
+    // to hold a connective, so the chip is its name.
+    const showConnective = !root || node.children.length >= 2;
+
     return (
       <div
         key={node.id}
-        className={cn("flex flex-col gap-1.5", !root && "border-l border-hairline pl-2.5")}
+        className={cn(
+          "flex flex-col items-start gap-1",
+          !root && "border-l border-border/80 py-0.5 pl-3",
+        )}
       >
-        <div className="flex items-center gap-1.5">
-          <Select
-            value={node.connective}
-            onValueChange={(next) =>
-              next &&
-              setWhere(
-                replaceNode(draft.where, node.id, {
-                  ...node,
-                  connective: next as "and" | "or",
-                }),
-              )
-            }
-            disabled={busy}
-          >
-            <SelectTrigger
-              size="sm"
-              className="h-6 w-[72px] font-mono text-[11px]"
-              aria-label="Group connective"
-            >
-              {/* The stored value is already the word we want to show, so
-                  Base UI's raw render is right here. */}
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="and" className="font-mono text-[11.5px]">
-                and
-              </SelectItem>
-              <SelectItem value="or" className="font-mono text-[11.5px]">
-                or
-              </SelectItem>
-            </SelectContent>
-          </Select>
-
-          {!root && (
-            <button
-              className="text-faint transition-colors hover:text-amber"
-              onClick={() => setWhere(removeNode(draft.where, node.id))}
+        {showConnective && (
+          <div className="group/row flex items-center gap-1">
+            <Select
+              value={node.connective}
+              onValueChange={(next) =>
+                next &&
+                setWhere(
+                  replaceNode(draft.where, node.id, {
+                    ...node,
+                    connective: next as "and" | "or",
+                  }),
+                )
+              }
               disabled={busy}
-              aria-label="Remove group"
             >
-              <X className="size-3" />
-            </button>
-          )}
-        </div>
+              <SelectTrigger
+                size="sm"
+                className={cn(
+                  CHEVRON,
+                  "h-5 gap-0.5 rounded-[4px] border-transparent bg-amber/10 py-0 pr-1 pl-1.5",
+                  "font-mono text-[10px] font-medium tracking-[0.08em] text-amber uppercase",
+                  "hover:bg-amber/15 dark:bg-amber/10 dark:hover:bg-amber/15",
+                  "[&_svg]:text-amber/60",
+                )}
+                aria-label="Group connective"
+              >
+                {/* The stored value is already the word we want to show, so
+                    Base UI's raw render is right here. */}
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="and" className="font-mono text-[11.5px]">
+                  and
+                </SelectItem>
+                <SelectItem value="or" className="font-mono text-[11.5px]">
+                  or
+                </SelectItem>
+              </SelectContent>
+            </Select>
+
+            {!root && (
+              <button
+                className="p-0.5 text-faint opacity-0 transition-opacity group-hover/row:opacity-100 hover:text-amber focus-visible:opacity-100"
+                onClick={() => setWhere(removeNode(draft.where, node.id))}
+                disabled={busy}
+                aria-label="Remove group"
+              >
+                <X className="size-3" />
+              </button>
+            )}
+          </div>
+        )}
 
         {node.children.map((child) => renderNode(child, depth + 1))}
 
-        <div className="flex items-center gap-1">
-          <Button
-            size="sm"
-            variant="ghost"
+        <div className="flex items-center gap-2.5">
+          <AddLink
             disabled={busy || columns.length === 0}
             onClick={() =>
               setWhere(appendTo(draft.where, node.id, newCondition(firstColumn)))
             }
           >
-            <Plus /> condition
-          </Button>
+            condition
+          </AddLink>
           {/* Nesting past a couple of levels stops being readable faster than
               it stops being expressible, so the offer ends at depth 2. */}
           {depth < 2 && (
-            <Button
-              size="sm"
-              variant="ghost"
+            <AddLink
               disabled={busy}
               onClick={() =>
-                setWhere(appendTo(draft.where, node.id, emptyGroup(node.connective === "and" ? "or" : "and")))
+                setWhere(
+                  appendTo(
+                    draft.where,
+                    node.id,
+                    emptyGroup(node.connective === "and" ? "or" : "and"),
+                  ),
+                )
               }
             >
-              <Plus /> group
-            </Button>
+              group
+            </AddLink>
           )}
         </div>
       </div>
@@ -259,57 +293,103 @@ export default function QueryBuilder(props: Props) {
   const hidden = new Set(draft.hidden);
 
   return (
-    <section className="flex max-h-[45%] flex-none flex-col gap-2 overflow-auto border-b border-border p-3">
+    <section className="flex max-h-[45%] flex-none flex-col gap-2.5 overflow-auto border-b border-border px-3 py-2.5">
       <Field label="where">{renderGroup(draft.where, 0, true)}</Field>
 
       <Field label="columns">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          {columns.map((name) => (
-            <label
-              key={name}
-              className="flex cursor-pointer items-center gap-1.5 font-mono text-[11.5px]"
-            >
-              <input
-                type="checkbox"
-                className="accent-amber"
-                checked={!hidden.has(name)}
+        <div className="flex flex-wrap items-center gap-1">
+          {columns.map((name) => {
+            const off = hidden.has(name);
+            return (
+              <button
+                key={name}
+                aria-pressed={!off}
                 disabled={busy}
-                onChange={(e) =>
+                onClick={() =>
                   setDraft({
                     ...draft,
-                    hidden: e.target.checked
+                    hidden: off
                       ? draft.hidden.filter((c) => c !== name)
                       : [...draft.hidden, name],
                   })
                 }
-              />
-              <span className={hidden.has(name) ? "text-faint line-through" : "text-foreground"}>
+                className={cn(
+                  "rounded-[4px] border px-1.5 py-[3px] font-mono text-[10.5px] leading-none transition-colors",
+                  off
+                    ? "border-transparent text-faint line-through hover:border-hairline hover:text-muted-foreground"
+                    : "border-hairline bg-card text-muted-foreground hover:border-border hover:text-foreground",
+                )}
+              >
                 {name}
-              </span>
-            </label>
-          ))}
+              </button>
+            );
+          })}
+          {draft.hidden.length > 0 && (
+            <button
+              className="ml-1 font-mono text-[10px] text-amber/80 transition-colors hover:text-amber"
+              disabled={busy}
+              onClick={() => setDraft({ ...draft, hidden: [] })}
+            >
+              {draft.hidden.length} hidden · show all
+            </button>
+          )}
         </div>
       </Field>
 
-      <div className="flex items-end gap-2 border-t border-hairline pt-2">
-        <pre className="m-0 min-w-0 flex-1 overflow-x-auto font-mono text-[11px] whitespace-pre-wrap text-faint">
-          {buildSql(draft)}
-        </pre>
-        <Button size="sm" variant="ghost" onClick={() => onEditAsSql(draft)} disabled={busy}>
-          Edit as SQL
-        </Button>
-        <Button size="sm" onClick={() => onApply(draft)} disabled={busy || !dirty}>
-          {busy ? "running" : dirty ? "Apply" : "Applied"}
-        </Button>
+      <div className="border-t border-hairline pt-2">
+        <div className="flex items-center gap-2.5">
+          <span className="w-[52px] flex-none font-mono text-[10px] tracking-[0.1em] text-faint uppercase">
+            sql
+          </span>
+          {/* Scrolls rather than wraps, and dissolves at the right edge so a
+              long statement reads as "continues" instead of "cut off". */}
+          <p className="m-0 min-w-0 flex-1 overflow-x-auto font-mono text-[10.5px] whitespace-nowrap text-faint [mask-image:linear-gradient(90deg,#000_calc(100%-28px),transparent)]">
+            {buildSql(draft)}
+          </p>
+          <button
+            className="flex-none font-mono text-[10.5px] text-muted-foreground transition-colors hover:text-amber disabled:opacity-40"
+            onClick={() => onEditAsSql(draft)}
+            disabled={busy}
+          >
+            edit as sql
+          </button>
+          <Button
+            size="xs"
+            variant={dirty ? "default" : "ghost"}
+            className="font-mono"
+            onClick={() => onApply(draft)}
+            disabled={busy || !dirty}
+          >
+            {busy ? "running" : dirty ? "Apply" : "applied"}
+          </Button>
+        </div>
       </div>
     </section>
+  );
+}
+
+/// The quiet way to grow the tree: reads as an affordance, not a control.
+function AddLink(props: {
+  disabled: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      className="flex items-center gap-1 py-0.5 font-mono text-[10.5px] text-faint transition-colors hover:text-amber disabled:opacity-40"
+      disabled={props.disabled}
+      onClick={props.onClick}
+    >
+      <span aria-hidden>+</span>
+      {props.children}
+    </button>
   );
 }
 
 function Field(props: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex gap-2.5">
-      <span className="w-[52px] flex-none pt-1.5 font-mono text-[10px] tracking-[0.1em] text-faint uppercase">
+      <span className="w-[52px] flex-none pt-[5px] font-mono text-[10px] tracking-[0.1em] text-faint uppercase">
         {props.label}
       </span>
       <div className="min-w-0 flex-1">{props.children}</div>

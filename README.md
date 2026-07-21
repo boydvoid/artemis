@@ -75,12 +75,20 @@ Override with `ARTEMIS_DB=/path/to/file`.
 file lives outside the repo and is gitignored, but treat it like any other
 credential store.
 
+The workspace session (open tabs, filters, sort, page sizes) lives
+separately in the WebView's localStorage under `artemis:session`. It holds
+no credentials and no query results; clearing the WebView's data resets
+the workspace but touches nothing in SQLite.
+
 ## Architecture
 
 The native side is the app. The web layer is its client: it renders and
-holds view state, but **owns no durable state of its own** — no
-localStorage, no IndexedDB, no cookies. Everything persistent goes through
-the bridge.
+holds view state, and everything with a claim to being the app's *data* —
+connections, saved queries, the active connection — goes through the
+bridge. The one deliberate exception is the workspace session (which tabs
+are open and what each was looking at): that is window shape, not data, so
+it lives in WebView localStorage (`frontend/src/lib/session.ts`) and losing
+it costs a re-open of a table, nothing more.
 
 ```
 React  ──  window.zero.invoke("db.exec",    { url, sql })  ──▶  psql     (a connected database)
@@ -117,10 +125,16 @@ registered, each reachable only from the origins listed in `main.zig`.
 | --- | --- |
 | `src/main.zig` | shell + the `db.exec` and `store.exec` handlers |
 | `frontend/src/lib/bridge.ts` | the one seam to native |
-| `frontend/src/lib/sql.ts` | SQL construction, quoting, pagination |
+| `frontend/src/lib/sql.ts` | SQL construction, quoting, the predicate tree, pagination |
 | `frontend/src/lib/parse.ts` | psql framed-output parsing |
 | `frontend/src/lib/store.ts` | app state via `store.exec` (SQLite) |
-| `frontend/src/components/DataGrid.tsx` | the results grid |
+| `frontend/src/lib/session.ts` | workspace restore (localStorage — the one exception) |
+| `frontend/src/lib/pgurl.ts` | connection URL ⇄ fields conversion |
+| `frontend/src/lib/monaco.ts` | Monaco setup: theme, SQL completions, keyword upcasing |
+| `frontend/src/lib/tabs.ts` | the query-tab model |
+| `frontend/src/components/DataGrid.tsx` | the results grid, incl. header sorting |
+| `frontend/src/components/QueryBuilder.tsx` | predicates + column picker for table tabs |
+| `frontend/src/components/SqlEditor.tsx` | the Monaco wrapper |
 | `frontend/src/components/Connections.tsx` | the home screen |
 | `frontend/src/App.tsx` | app state, routing and composition |
 
@@ -147,23 +161,43 @@ is utility classes.
 ## Screens
 
 **Home** is the connections list: add, open, or delete a saved connection.
-Opening one enters the workspace; the remembered active connection is
-marked but is not auto-opened, so launching always lands here.
+A connection can be entered either as a URL or through a **Fields** editor
+(host, port, database, user, password, ssl mode) — the fields build the
+same URL, percent-encoding a password whose `@`, `:` or `/` would otherwise
+silently change what the URL means. Only the URL is stored.
 
-**Workspace** is the tabbed editor, results grid and table browser. The rail
-header shows the active connection and is the way back home — returning
-keeps the connection active, so re-entering does not re-run the catalog
-query. Switching to a *different* connection clears the tables and grid and
-reloads.
+**Workspace** is the tabbed editor, query builder, results grid and table
+browser. The rail header shows the active connection and is the way back
+home. Switching to a *different* connection clears sources and results but
+keeps statement text and page-size preferences.
+
+**Reopening the app restores the last session** — the workspace, its tabs,
+their filters, hidden columns, sort and page sizes — provided the session
+belongs to the remembered connection. The active tab re-runs on open;
+others re-run when you switch to them. Results and staged edits are never
+restored: a cached page presented as current is worse than an empty grid,
+and a staged edit committed after a restart could overwrite someone else's
+change. With no session to restore, launching lands on Home.
 
 ## Working
 
 Connections (add, open, delete, persisted), table browser with filter,
-SQL editor (⌘↵ to run), keyed table views ordered by primary key (ctid
-fallback), OFFSET pagination with a probe row, psql errors surfaced
-verbatim, and a results grid with real per-column min-widths, horizontal
-scroll, a pinned header and row gutter, and drag-resizable columns
-(double-click a divider to reset).
+Monaco SQL editor, a query builder on table tabs, keyed table views ordered
+by primary key (ctid fallback), column-header sorting, OFFSET pagination
+with a probe row and a page-size picker (25/50/100/250, per tab), psql
+errors surfaced verbatim, session restore on reopen, and a results grid
+with real per-column min-widths, horizontal scroll, a pinned header and row
+gutter, and drag-resizable columns (double-click a divider to reset).
+
+### SQL editor
+
+Query tabs get a Monaco editor: Postgres highlighting, ⌘↵ to run,
+autocomplete fed by the connection's table list plus the active result's
+columns, and keywords upper-cased as you finish typing them (the tokenizer
+decides what is a keyword, so `select` inside a string, comment or quoted
+identifier is left alone). The editor pane is resizable by dragging its
+bottom edge; double-click the divider to reset. Monaco is bundled, not
+CDN-loaded — the WebView may be offline.
 
 ### Editing
 
@@ -180,8 +214,12 @@ grid refreshes from the database rather than from local state — which
 matters because UPDATE rewrites rows and their ctids change.
 
 A failed commit rolls back and keeps the batch staged, so nothing is
-silently lost. Staged edits are dropped when you change page, table, or
-query, since they address rows that are no longer on screen.
+silently lost. Staged edits are dropped when you change page, predicates
+or columns, since they address rows that may no longer be in the set —
+but they **survive re-sorting**: each edit carries the WHERE that
+addresses its row, resolved when it was staged, so it commits correctly
+no matter where sorting moves the row. They are also not persisted across
+an app restart, deliberately.
 
 Editing is only offered for keyed table views: a join or an expression
 has no single row to write back to.
@@ -189,39 +227,54 @@ has no single row to write back to.
 The literal text `NULL` sets a column NULL (inherited from the native
 app), which means you cannot store the four characters "NULL".
 
-### Filters
+### Query builder
 
-Table views carry a filter bar: pick a column and operator, add a value,
-and the filter becomes a chip. Operators are `=`, `!=`, `>`, `<`, `>=`,
-`<=`, `contains`, `is null`, `is not null`; valueless operators hide the
-value input.
+A table tab shows a query builder instead of the SQL editor: a predicate
+tree, a column picker, and a live preview of the SQL it produces. Edits
+are local until **Apply**; **Edit as SQL** hands the statement (without
+the ctid/paging plumbing) to a fresh query tab when the builder runs out
+of road — it stops short of joins and aggregates by design, because those
+would break row addressing and with it inline editing.
 
-Filters AND together and are applied **server-side** in the table's WHERE
-clause, so they narrow the real result set — pagination and row numbers
-stay honest rather than describing a set the client already fetched. They
-also ride the commit statement's trailing select, so a row edited out of
-the filtered set correctly disappears after commit.
+Conditions nest in `and`/`or` groups, so `a AND (b OR c)` is expressible;
+operators are `=`, `!=`, `>`, `<`, `>=`, `<=`, `contains`, `is null`,
+`is not null`. `contains` is `::text ILIKE '%value%'` (case-insensitive,
+works on non-text columns); the ordering operators compare in the column's
+own type, so `qty > 50` on an integer column is numeric, not
+lexicographic. The whole predicate is applied **server-side** in the
+table's WHERE clause, so it narrows the real result set — pagination and
+row numbers stay honest — and it rides the commit statement's trailing
+select, so a row edited out of the filtered set disappears after commit.
 
-`contains` is `::text ILIKE '%value%'` (case-insensitive, works on
-non-text columns). The ordering operators compare in the column's own
-type, so `qty > 50` on an integer column is numeric, not lexicographic.
+The column picker hides columns from the select list (the full column set
+is remembered, so a hidden column can always be brought back). Hiding
+every column reads as hiding none.
 
-Changing filters resets to page 0 and drops staged edits, since both
-address rows that may no longer be in the set.
+### Sorting
+
+Click a column header to sort by it — asc, desc, then unsorted; shift-click
+adds a column to the existing sort, with precedence numbers on the headers.
+Ordering is server-side (whole table, not the loaded page), and the primary
+key always trails the chosen sort as a tiebreaker, because OFFSET
+pagination repeats or skips rows whenever the ordering leaves ties.
+Headers are inert on query tabs: a free-form statement has no single table
+to re-order and may carry its own ORDER BY.
 
 ### Tabs
 
-A query tab is a whole document: its own statement, result, page position
-and staged edits. Nothing is shared between tabs, so a commit can never
-land against rows a different tab is showing. Opening a table renames the
-tab after it; `+` opens a blank one; the last tab cannot be closed. A tab
-with staged edits shows an amber dot, so closing one never silently drops
-pending work.
+A tab is a whole document: its own statement or table, result, page
+position, page size and staged edits. Nothing is shared between tabs, so a
+commit can never land against rows a different tab is showing.
 
-**Filters** is pinned at the end of the strip, past a divider, because it
-is a different kind of thing: a panel mode, not a document. It edits the
-*active* query tab's filters and carries that tab's filter count as a
-badge. It is disabled unless the active tab is a table view.
+What a tab *is* decides what it shows: a table opened from the rail gets
+the query builder, a query tab gets the SQL editor — there is no mode to
+switch. Clicking a table that is already open focuses its tab rather than
+duplicating it; opening a new table takes over the tab in front of you
+only if that tab is untouched, and otherwise opens its own. `+` opens a
+blank query tab; the last tab cannot be closed. A tab with staged edits
+shows an amber dot, and a filtered table tab carries its condition count
+as a badge, so neither pending work nor a narrowed result is ever
+invisible from the strip.
 
 ### Saved queries
 
@@ -264,7 +317,9 @@ That is the whole reason this project moved to a WebView.
 
 ## Contributing
 
-Issues and pull requests welcome. Before opening a PR:
+Feel free to contribute — and fork as much as you want. It's MIT: take it,
+bend it into the Postgres browser you actually wanted, no permission
+needed. Issues and pull requests are just as welcome. Before opening a PR:
 
 ```sh
 ./frontend/node_modules/.bin/tsc -p frontend/tsconfig.json   # typecheck
