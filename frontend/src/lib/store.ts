@@ -5,6 +5,11 @@
 // used (`.artemis/artemis.db`), so the web layer holds no durable state of
 // its own — it is a client for the app, not a second copy of it.
 //
+// One exception, added deliberately: `./session.ts` keeps the open tabs in
+// localStorage. That is window shape rather than app data — the native side
+// has no use for it, and losing it costs a re-open of a table. Everything
+// with a claim to being the app's data still belongs here.
+//
 // Schema and statements mirror ../../../src/db.ts so both front ends see
 // exactly one store.
 

@@ -1,13 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, RefreshCw, Save, Trash2, X } from "lucide-react";
 import Connections from "@/components/Connections";
 import DataGrid from "@/components/DataGrid";
-import FilterBar from "@/components/FilterBar";
+import QueryBuilder from "@/components/QueryBuilder";
+import SqlEditor from "@/components/SqlEditor";
 import TabStrip from "@/components/TabStrip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { bridgeAvailable, exec } from "@/lib/bridge";
+import { setCompletionSchema } from "@/lib/monaco";
 import {
   addConnection as storeAdd,
   deleteConnection as storeDelete,
@@ -22,18 +31,29 @@ import {
   type SavedQuery,
 } from "@/lib/store";
 import { parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
+import { hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
 import {
-  PAGE_SIZE,
+  DEFAULT_PAGE_SIZE,
+  PAGE_SIZES,
   TABLES_SQL,
   commitSql,
   dataSql,
+  emptyQuery,
   isPageable,
   pkSql,
+  plainSql,
   rowPredicate,
   wrapPaged,
-  type Filter,
+  type Sort,
+  type TableQuery,
 } from "@/lib/sql";
 import { freshTab, tabById, withTab, type QueryTab } from "@/lib/tabs";
+
+/// Editor pane sizing. The default is deliberately roomy — this is where you
+/// write, and four lines was cramped for anything with a join in it.
+const DEFAULT_EDITOR_HEIGHT = 180;
+const MIN_EDITOR_HEIGHT = 56;
+const MIN_GRID_HEIGHT = 140;
 
 export default function App() {
   // Connections are the home screen; picking one opens the workspace.
@@ -50,11 +70,18 @@ export default function App() {
   const [tabs, setTabs] = useState<QueryTab[]>([freshTab(1)]);
   const [activeTabId, setActiveTabId] = useState(1);
   const [nextTabId, setNextTabId] = useState(2);
-  const [panel, setPanel] = useState<"query" | "filters">("query");
   const [saveName, setSaveName] = useState<string | null>(null);
+  // Lives here, not in Editor: moving to a table tab unmounts the editor, and
+  // coming back should not throw away the size you chose.
+  const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_HEIGHT);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  /// Session restore bookkeeping. `booted` gates saving so the empty first
+  /// render cannot overwrite the session we are about to load.
+  const [booted, setBooted] = useState(false);
+  const connectionSeenRef = useRef(false);
 
   const active = useMemo(
     () => connections.find((c) => c.id === activeId) ?? null,
@@ -90,11 +117,29 @@ export default function App() {
         if (cancelled) return;
         setConnections(rows);
         setSaved(savedRows);
-        if (rows.some((c) => c.id === activeConn)) setActiveId(activeConn);
+
+        const known = rows.some((c) => c.id === activeConn);
+        if (known) setActiveId(activeConn);
+
+        // Restore the workspace only for the connection it was built against.
+        // The tabs name tables in one specific database; against another they
+        // would be a list of things that may not exist.
+        const session = loadSession();
+        if (known && session && session.connectionId === activeConn) {
+          setTabs(session.tabs.map(hydrateTab));
+          setActiveTabId(session.activeTabId);
+          setNextTabId(session.nextTabId);
+          setEditorHeight(session.editorHeight);
+          setScreen(session.screen);
+        }
       } catch (storeError) {
         if (!cancelled) {
           setError(storeError instanceof Error ? storeError.message : String(storeError));
         }
+      } finally {
+        // Until boot has had its say, the state on screen is the empty
+        // default — saving it would overwrite the session we came to load.
+        if (!cancelled) setBooted(true);
       }
     })();
     return () => {
@@ -147,81 +192,223 @@ export default function App() {
       setTables([]);
       return;
     }
-    setTabs((prev) =>
-      prev.map((t) => ({ ...freshTab(t.id, t.name), sql: t.sql, savedId: t.savedId })),
-    );
+    // The first connection of a session is not a switch — it is either the one
+    // restored from the session or the one just picked on the home screen, and
+    // in both cases the tabs already describe it. Resetting here would throw
+    // away the very workspace boot just restored.
+    if (connectionSeenRef.current) {
+      setTabs((prev) =>
+        // Page size is a view preference like the statement text, not data that
+        // belonged to the old database — both survive the switch.
+        prev.map((t) => ({
+          ...freshTab(t.id, t.name),
+          sql: t.sql,
+          savedId: t.savedId,
+          pageSize: t.pageSize,
+        })),
+      );
+    }
+    connectionSeenRef.current = true;
     void loadTables();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
+  // Autocomplete reads the schema we already loaded for the rail, plus the
+  // columns of whatever the active tab last returned.
+  useEffect(() => {
+    setCompletionSchema(tables, tab.page.cols);
+  }, [tables, tab.page.cols]);
+
+  // Persist the workspace. The timer debounces: `tabs` changes on every
+  // keystroke in the editor, and localStorage writes are synchronous.
+  useEffect(() => {
+    if (!booted) return;
+    const timer = setTimeout(() => {
+      saveSession({
+        version: 1,
+        connectionId: activeId,
+        screen,
+        tabs: tabs.map(storeTab),
+        activeTabId,
+        nextTabId,
+        editorHeight,
+      });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [booted, activeId, screen, tabs, activeTabId, nextTabId, editorHeight]);
+
+  // A restored tab carries a query but no rows — results are not persisted.
+  // Run it the first time you actually look at it, which covers the active tab
+  // at startup and the others as you reach them, without firing every tab's
+  // query at once. A source with no columns only ever means "restored, not yet
+  // run": switching connections clears the source outright.
+  useEffect(() => {
+    if (!active || tab.source.kind === "none" || tab.page.cols.length > 0) return;
+    void goToPage(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, activeTabId, tab.source.kind]);
+
   async function openTable(table: TableRef) {
+    // Already open? Go to it. Clicking a table twice should not produce two
+    // of it, and the one you have may be carrying filters and staged edits.
+    const open = tabs.find(
+      (t) => t.source.kind === "table" && t.source.table.id === table.id,
+    );
+    if (open) {
+      setActiveTabId(open.id);
+      setSaveName(null);
+      return;
+    }
+
     const pkResult = await run(pkSql(table.schema, table.name));
     // No primary key is fine — orderSql falls back to ctid.
     const pkCols = pkResult === null ? [] : parsePkCols(pkResult.out);
-    const statement = dataSql(table.schema, table.name, [], pkCols, 0);
+    // Taking over the tab in front of you inherits its page size; a brand new
+    // tab starts at the default. Deciding this before the query is what keeps
+    // the tab's pageSize and the rows it is holding from disagreeing.
+    const pristine =
+      tab.source.kind === "none" && tab.sql.trim().length === 0 && tab.savedId === 0;
+    const size = pristine ? tab.pageSize : DEFAULT_PAGE_SIZE;
+
+    const query = emptyQuery();
+    const statement = dataSql(table.schema, table.name, query, pkCols, 0, size);
     const result = await run(statement);
     if (result === null) return;
-    patchTab({
+
+    // The opening page is unprojected, so its columns are the table's whole
+    // set — the one chance to capture it before the builder starts hiding.
+    const page = parsePage(result.out, true, size);
+
+    const loaded = {
       name: table.name,
       sql: statement,
-      source: { kind: "table", table, pkCols, filters: [] },
-      page: parsePage(result.out, true),
+      source: { kind: "table" as const, table, pkCols, columns: page.cols, query },
+      page,
       pageIndex: 0,
+      pageSize: size,
       staged: [],
       status: `${table.schema}.${table.name}`,
       elapsed: result.ms,
-    });
-    setPanel("query");
+    };
+
+    // Take over the tab in front of you only when it is untouched. A table is
+    // its own document now — opening one must not eat a query you were
+    // writing, or the filters on the table already there.
+    if (pristine) {
+      patchTab(loaded);
+      return;
+    }
+
+    const created: QueryTab = { ...freshTab(nextTabId), ...loaded };
+    setTabs((prev) => [...prev, created]);
+    setActiveTabId(created.id);
+    setNextTabId((n) => n + 1);
+    setSaveName(null);
   }
 
-  /// Re-run the current table at page 0 under a new filter set. Filters
-  /// change which rows exist, so the old page index is meaningless.
-  async function applyFilters(next: Filter[]) {
+  /// Re-run the current table at page 0 under a new query. Every part of the
+  /// query changes which rows land on which page, so the old page index is
+  /// meaningless.
+  ///
+  /// `keepStaged` is for re-ordering. A staged edit carries the WHERE that
+  /// addressed its row, resolved when it was staged, so it commits correctly
+  /// no matter where the row sits afterwards — and a sort is one click, far
+  /// too casual a gesture to throw away pending edits. Changing predicates or
+  /// columns still clears them: a filter can drop the row from the result
+  /// entirely, and hiding a column invalidates the staged column index.
+  async function applyQuery(next: TableQuery, keepStaged = false) {
     if (tab.source.kind !== "table") return;
-    const { table, pkCols } = tab.source;
-    const statement = dataSql(table.schema, table.name, next, pkCols, 0);
+    const { table, pkCols, columns } = tab.source;
+    const statement = dataSql(
+      table.schema,
+      table.name,
+      next,
+      pkCols,
+      0,
+      tab.pageSize,
+      columns,
+    );
     const result = await run(statement);
     if (result === null) return;
     patchTab({
       sql: statement,
-      source: { kind: "table", table, pkCols, filters: next },
-      page: parsePage(result.out, true),
+      source: { kind: "table", table, pkCols, columns, query: next },
+      page: parsePage(result.out, true, tab.pageSize),
       pageIndex: 0,
-      staged: [],
+      staged: keepStaged ? tab.staged : [],
       elapsed: result.ms,
     });
+  }
+
+  /// Header click cycles that column asc → desc → unsorted. A plain click
+  /// sorts by it alone; shift-click folds it into the existing sort so a
+  /// second key can be added without a separate control.
+  function toggleSort(column: string, additive: boolean) {
+    if (tab.source.kind !== "table") return;
+    const current = tab.source.query.sort;
+    const existing = current.find((entry) => entry.column === column);
+
+    let next: Sort[];
+    if (!existing) {
+      next = additive ? [...current, { column, dir: "asc" }] : [{ column, dir: "asc" }];
+    } else if (existing.dir === "asc") {
+      const flipped: Sort = { column, dir: "desc" };
+      next = additive
+        ? current.map((entry) => (entry.column === column ? flipped : entry))
+        : [flipped];
+    } else {
+      next = additive ? current.filter((entry) => entry.column !== column) : [];
+    }
+
+    void applyQuery({ ...tab.source.query, sort: next }, true);
   }
 
   async function runEditor() {
     const statement = tab.sql.trim();
     if (statement.length === 0) return;
     const pageable = isPageable(statement);
-    const result = await run(pageable ? wrapPaged(statement, 0) : statement);
+    const result = await run(pageable ? wrapPaged(statement, 0, tab.pageSize) : statement);
     if (result === null) return;
     patchTab({
       source: pageable ? { kind: "sql", sql: statement } : { kind: "none" },
-      page: parsePage(result.out, false),
+      page: parsePage(result.out, false, tab.pageSize),
       pageIndex: 0,
       staged: [],
       status: pageable ? "query" : "query (single run)",
       elapsed: result.ms,
     });
-    setPanel("query");
   }
 
-  async function goToPage(next: number) {
-    if (next < 0 || tab.source.kind === "none") return;
-    const offset = next * PAGE_SIZE;
+  /// Move to a page, optionally resizing it. Changing the size goes through
+  /// here rather than a path of its own: the offset is a function of the size,
+  /// so the two have to be decided together or the page lands in the wrong
+  /// place. A resize always lands on page 0 for the same reason.
+  async function goToPage(next: number, size = tab.pageSize) {
+    if (next < 0) return;
     const source = tab.source;
+    if (source.kind === "none") {
+      patchTab({ pageSize: size });
+      return;
+    }
+    const offset = next * size;
     const statement =
       source.kind === "table"
-        ? dataSql(source.table.schema, source.table.name, source.filters, source.pkCols, offset)
-        : wrapPaged(source.sql, offset);
+        ? dataSql(
+            source.table.schema,
+            source.table.name,
+            source.query,
+            source.pkCols,
+            offset,
+            size,
+            source.columns,
+          )
+        : wrapPaged(source.sql, offset, size);
     const result = await run(statement);
     if (result === null) return;
     patchTab({
-      page: parsePage(result.out, source.kind === "table"),
+      page: parsePage(result.out, source.kind === "table", size),
       pageIndex: next,
+      pageSize: size,
       staged: [],
       elapsed: result.ms,
       ...(source.kind === "table" ? { sql: statement } : {}),
@@ -261,9 +448,11 @@ export default function App() {
       tab.source.table.schema,
       tab.source.table.name,
       tab.staged,
-      tab.source.filters,
+      tab.source.query,
       tab.source.pkCols,
-      tab.pageIndex * PAGE_SIZE,
+      tab.pageIndex * tab.pageSize,
+      tab.pageSize,
+      tab.source.columns,
     );
     const result = await run(statement);
     // A failed commit leaves the batch intact so nothing is silently lost;
@@ -272,7 +461,7 @@ export default function App() {
     const count = tab.staged.length;
     patchTab({
       staged: [],
-      page: parsePage(result.out, true),
+      page: parsePage(result.out, true, tab.pageSize),
       status: `committed ${count} edit${count === 1 ? "" : "s"}`,
       elapsed: result.ms,
     });
@@ -285,7 +474,6 @@ export default function App() {
     setTabs((prev) => [...prev, created]);
     setActiveTabId(created.id);
     setNextTabId((n) => n + 1);
-    setPanel("query");
     setSaveName(null);
   }
 
@@ -300,7 +488,6 @@ export default function App() {
 
   function selectTab(id: number) {
     setActiveTabId(id);
-    setPanel("query");
     setSaveName(null);
   }
 
@@ -337,7 +524,6 @@ export default function App() {
     setTabs((prev) => [...prev, created]);
     setActiveTabId(created.id);
     setNextTabId((n) => n + 1);
-    setPanel("query");
   }
 
   async function removeSaved(id: number) {
@@ -399,10 +585,25 @@ export default function App() {
     return tables.filter((t) => `${t.schema}.${t.name}`.toLowerCase().includes(needle));
   }, [tables, tableFilter]);
 
-  const filters = tab.source.kind === "table" ? tab.source.filters : [];
+  /// Hand the builder's statement to a fresh query tab. The builder stops
+  /// short of joins and aggregates by design; this is the way past it, and
+  /// the table tab it came from is left untouched.
+  function editAsSql(query: TableQuery) {
+    if (tab.source.kind !== "table") return;
+    const { table, pkCols, columns } = tab.source;
+    const created: QueryTab = {
+      ...freshTab(nextTabId, table.name),
+      sql: plainSql(table.schema, table.name, query, pkCols, columns),
+    };
+    setTabs((prev) => [...prev, created]);
+    setActiveTabId(created.id);
+    setNextTabId((n) => n + 1);
+    setSaveName(null);
+  }
+
   const stagedRowCount = new Set(tab.staged.map((e) => e.key)).size;
-  const firstRow = tab.pageIndex * PAGE_SIZE + (tab.page.rows.length > 0 ? 1 : 0);
-  const lastRow = tab.pageIndex * PAGE_SIZE + tab.page.rows.length;
+  const firstRow = tab.pageIndex * tab.pageSize + (tab.page.rows.length > 0 ? 1 : 0);
+  const lastRow = tab.pageIndex * tab.pageSize + tab.page.rows.length;
 
   if (screen === "home") {
     return (
@@ -442,16 +643,15 @@ export default function App() {
         <TabStrip
           tabs={tabs}
           activeTabId={activeTabId}
-          panel={panel}
-          filterCount={filters.length}
-          filtersEnabled={tab.source.kind === "table"}
           onSelect={selectTab}
           onClose={closeTab}
           onNew={newTab}
-          onShowFilters={() => setPanel("filters")}
         />
 
-        {panel === "query" ? (
+        {/* What a tab is decides what it shows: a table you opened is browsed
+            through its filters, a query tab is written as SQL. There is no
+            mode to switch — the two never applied to the same document. */}
+        {tab.source.kind !== "table" ? (
           <Editor
             sql={tab.sql}
             setSql={(v) => patchTab({ sql: v })}
@@ -463,13 +663,30 @@ export default function App() {
             onStartSave={() => setSaveName(tab.name)}
             onCommitSave={() => void commitSave()}
             isSaved={tab.savedId > 0}
+            height={editorHeight}
+            setHeight={setEditorHeight}
           />
         ) : (
-          <FilterBar
-            columns={tab.page.cols}
-            filters={filters}
+          <QueryBuilder
+            // Per tab: the half-built predicate you left on one table should
+            // not reappear on the next one.
+            key={tab.id}
+            columns={tab.source.columns}
+            query={tab.source.query}
             busy={busy}
-            onChange={(next) => void applyFilters(next)}
+            onApply={(next) => void applyQuery(next)}
+            onEditAsSql={editAsSql}
+            buildSql={(q) =>
+              tab.source.kind === "table"
+                ? plainSql(
+                    tab.source.table.schema,
+                    tab.source.table.name,
+                    q,
+                    tab.source.pkCols,
+                    tab.source.columns,
+                  )
+                : ""
+            }
           />
         )}
 
@@ -524,6 +741,8 @@ export default function App() {
           staged={stagedMap}
           editable={tab.source.kind === "table"}
           onStage={stageEdit}
+          sort={tab.source.kind === "table" ? tab.source.query.sort : []}
+          onSort={tab.source.kind === "table" ? toggleSort : undefined}
         />
 
         <footer className="flex h-7 flex-none items-center gap-3 border-t border-border bg-card px-3 font-mono text-[11px] text-muted-foreground">
@@ -550,7 +769,31 @@ export default function App() {
           )}
           {tab.elapsed > 0 && <span className="text-faint">{tab.elapsed} ms</span>}
           {tab.source.kind !== "none" && (
-            <span className="flex gap-0.5">
+            <span className="flex items-center gap-0.5">
+              <Select
+                value={String(tab.pageSize)}
+                onValueChange={(next) => next && void goToPage(0, Number(next))}
+                disabled={busy}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="h-5 w-[78px] border-none font-mono text-[11px] text-faint"
+                  aria-label="Rows per page"
+                >
+                  <SelectValue>{(value) => `${value} rows`}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZES.map((size) => (
+                    <SelectItem
+                      key={size}
+                      value={String(size)}
+                      className="font-mono text-[11.5px]"
+                    >
+                      {size} rows
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <Button
                 size="icon-xs"
                 variant="ghost"
@@ -706,26 +949,63 @@ function Editor(props: {
   onStartSave: () => void;
   onCommitSave: () => void;
   isSaved: boolean;
+  height: number;
+  setHeight: (v: number) => void;
 }) {
-  // Cmd/Ctrl+Enter runs, matching every other SQL console.
-  function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-      event.preventDefault();
-      props.onRun();
+  const sectionRef = useRef<HTMLElement>(null);
+  const dragRef = useRef<{ startY: number; startHeight: number } | null>(null);
+
+  // Same shape as the grid's column resize: the drag lives on window so the
+  // pointer can leave the 7px handle without dropping it.
+  const setHeightRef = useRef(props.setHeight);
+  setHeightRef.current = props.setHeight;
+
+  useEffect(() => {
+    function onMove(event: MouseEvent) {
+      const drag = dragRef.current;
+      if (!drag) return;
+      // The grid needs to keep a usable amount of room no matter how far the
+      // drag goes, so the ceiling comes from the pane we live in.
+      const pane = sectionRef.current?.parentElement;
+      const ceiling = pane
+        ? pane.clientHeight - MIN_GRID_HEIGHT
+        : Number.POSITIVE_INFINITY;
+      const wanted = drag.startHeight + (event.clientY - drag.startY);
+      setHeightRef.current(
+        Math.max(MIN_EDITOR_HEIGHT, Math.min(ceiling, wanted)),
+      );
     }
+    function onUp() {
+      if (!dragRef.current) return;
+      dragRef.current = null;
+      document.body.classList.remove("resizing-row");
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  function startResize(event: React.MouseEvent) {
+    event.preventDefault();
+    dragRef.current = { startY: event.clientY, startHeight: props.height };
+    document.body.classList.add("resizing-row");
   }
 
   return (
-    <section className="flex flex-none flex-col gap-2 border-b border-border p-3">
+    <section
+      ref={sectionRef}
+      className="relative flex flex-none flex-col gap-2 border-b border-border p-3"
+    >
       <div className="flex items-stretch gap-2.5">
-        <textarea
-          className="h-[78px] flex-1 resize-y rounded-md border border-input bg-background px-2 py-1.5 font-mono text-[12.5px] leading-relaxed text-foreground outline-none placeholder:text-faint focus:border-ring"
+        <SqlEditor
+          className="flex-1"
+          style={{ height: props.height }}
           value={props.sql}
-          onChange={(e) => props.setSql(e.target.value)}
-          onKeyDown={onKeyDown}
-          spellCheck={false}
-          placeholder="SELECT * FROM ..."
-          aria-label="SQL editor"
+          onChange={props.setSql}
+          onRun={props.onRun}
         />
         <div className="flex flex-col items-center gap-1.5">
           <Button onClick={props.onRun} disabled={props.busy || props.disabled}>
@@ -767,6 +1047,15 @@ function Editor(props: {
           </Button>
         </div>
       )}
+
+      <div
+        className="row-resize"
+        onMouseDown={startResize}
+        onDoubleClick={() => props.setHeight(DEFAULT_EDITOR_HEIGHT)}
+        title="Drag to resize · double-click to reset"
+        role="separator"
+        aria-orientation="horizontal"
+      />
     </section>
   );
 }

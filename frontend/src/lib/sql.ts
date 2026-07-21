@@ -4,7 +4,11 @@
 // app-core subset checker; here it is plain strings, but the statements
 // and the quoting rules are the same.
 
-export const PAGE_SIZE = 15;
+/// Rows per page. 15 came over from the canvas app and made you page through
+/// anything real; 50 fills a window without making the +1 probe row costly.
+/// The size is per-tab — see QueryTab.pageSize.
+export const DEFAULT_PAGE_SIZE = 50;
+export const PAGE_SIZES: readonly number[] = [25, 50, 100, 250];
 
 /// A quoted identifier. Doubling embedded quotes is what makes a column
 /// literally named `we"ird` safe to interpolate.
@@ -33,11 +37,77 @@ export type FilterOp =
   | "is_null"
   | "not_null";
 
-export interface Filter {
+/// The predicate tree.
+///
+/// This used to be a flat `Filter[]`, which was an implicit AND. A group
+/// makes the connective explicit and lets it nest, which is the whole
+/// difference between a filter list and a query builder: `a AND (b OR c)`
+/// has no flat spelling.
+export interface Condition {
+  kind: "condition";
   id: string;
   column: string;
   op: FilterOp;
   value: string;
+}
+
+export interface Group {
+  kind: "group";
+  id: string;
+  connective: "and" | "or";
+  children: Predicate[];
+}
+
+export type Predicate = Condition | Group;
+
+export interface Sort {
+  column: string;
+  dir: "asc" | "desc";
+}
+
+/// Everything the builder controls for one table.
+export interface TableQuery {
+  where: Group;
+  sort: Sort[];
+  /// Columns the user hid. Storing what is hidden rather than what is shown
+  /// means a column added to the table later appears by default.
+  hidden: string[];
+}
+
+/// Ids only have to be unique within a session — they key React lists and
+/// address nodes for edit, and never outlive the tab.
+let nodeSeq = 0;
+export function nodeId(): string {
+  nodeSeq += 1;
+  return `n${nodeSeq}`;
+}
+
+/// A restored tree carries ids minted in an earlier session, while the counter
+/// above starts back at zero. Push it past whatever came back or the next new
+/// node collides with one already in the tree — and since every tree edit is
+/// addressed by id, the edit would silently land on the wrong node.
+export function reserveNodeIds(node: Predicate): void {
+  const match = /^n(\d+)$/.exec(node.id);
+  if (match) nodeSeq = Math.max(nodeSeq, Number(match[1]));
+  if (node.kind === "group") for (const child of node.children) reserveNodeIds(child);
+}
+
+export function emptyGroup(connective: "and" | "or" = "and"): Group {
+  return { kind: "group", id: nodeId(), connective, children: [] };
+}
+
+export function emptyQuery(): TableQuery {
+  return { where: emptyGroup(), sort: [], hidden: [] };
+}
+
+export function newCondition(column: string): Condition {
+  return { kind: "condition", id: nodeId(), column, op: "eq", value: "" };
+}
+
+/// Conditions in the tree, for the tab badge.
+export function countConditions(node: Predicate): number {
+  if (node.kind === "condition") return 1;
+  return node.children.reduce((n, child) => n + countConditions(child), 0);
 }
 
 export const FILTER_OPS: ReadonlyArray<{ op: FilterOp; label: string }> = [
@@ -67,7 +137,7 @@ export function opTakesValue(op: FilterOp): boolean {
 /// works on non-text columns too; the ordering operators compare in the
 /// column's own type, which is what makes `qty > 10` numeric rather than
 /// lexicographic.
-export function filterClause(filter: Filter): string {
+export function conditionSql(filter: Condition): string {
   const column = ident(filter.column);
   switch (filter.op) {
     case "eq":
@@ -91,13 +161,35 @@ export function filterClause(filter: Filter): string {
   }
 }
 
-/// " WHERE a AND b" for the filter set ("" when empty).
-export function whereSql(filters: readonly Filter[]): string {
-  if (filters.length === 0) return "";
-  return ` WHERE ${filters.map(filterClause).join(" AND ")}`;
+/// One node as SQL. Empty groups vanish rather than emitting `()`, and a
+/// group of one needs no parentheses — so a half-built tree still produces a
+/// statement that runs, which is what lets the preview update as you type.
+export function predicateSql(node: Predicate): string {
+  if (node.kind === "condition") {
+    if (opTakesValue(node.op) && node.value.length === 0) return "";
+    if (node.column.length === 0) return "";
+    return conditionSql(node);
+  }
+  const parts = node.children.map(predicateSql).filter((part) => part.length > 0);
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0];
+  return `(${parts.join(node.connective === "and" ? " AND " : " OR ")})`;
 }
 
-export function filterLabel(filter: Filter): string {
+/// " WHERE ..." for the tree ("" when it contributes nothing).
+///
+/// The root is joined here rather than through `predicateSql` so the whole
+/// clause is not wrapped in a redundant outer pair of parentheses — this SQL
+/// is read in the preview and handed to a query tab, so it should look like
+/// something a person would have written.
+export function whereSql(where: Group): string {
+  const parts = where.children.map(predicateSql).filter((part) => part.length > 0);
+  if (parts.length === 0) return "";
+  const glue = where.connective === "and" ? " AND " : " OR ";
+  return ` WHERE ${parts.join(glue)}`;
+}
+
+export function conditionLabel(filter: Condition): string {
   if (!opTakesValue(filter.op)) return `${filter.column} ${opLabel(filter.op)}`;
   return `${filter.column} ${opLabel(filter.op)} ${filter.value}`;
 }
@@ -113,12 +205,30 @@ export function pkSql(schema: string, name: string): string {
   );
 }
 
-/// A deterministic ORDER BY: the primary key when known, ctid otherwise.
-/// Stable ordering is what keeps OFFSET pagination from repeating or
-/// skipping rows between pages.
-export function orderSql(pkCols: readonly string[]): string {
-  if (pkCols.length === 0) return " ORDER BY ctid";
-  return ` ORDER BY ${pkCols.map(ident).join(", ")}`;
+/// The user's sort, made total.
+///
+/// Whatever they picked, the key always trails it: OFFSET pagination repeats
+/// and skips rows whenever the ordering leaves ties, so a sort on a column
+/// with duplicates is only safe with a unique tiebreaker behind it.
+export function orderSql(sort: readonly Sort[], pkCols: readonly string[]): string {
+  const parts = sort
+    .filter((entry) => entry.column.length > 0)
+    .map((entry) => `${ident(entry.column)} ${entry.dir === "desc" ? "DESC" : "ASC"}`);
+  const chosen = new Set(sort.map((entry) => entry.column));
+  if (pkCols.length === 0) parts.push("ctid");
+  else for (const pk of pkCols) if (!chosen.has(pk)) parts.push(ident(pk));
+  return ` ORDER BY ${parts.join(", ")}`;
+}
+
+/// The select list. `columns` is the table's full column set, not the last
+/// page's — otherwise hiding two columns and unhiding one would lose the
+/// other, since the page no longer knows it exists.
+function projectionSql(columns: readonly string[], hidden: readonly string[]): string {
+  if (columns.length === 0 || hidden.length === 0) return "*";
+  const visible = columns.filter((name) => !hidden.includes(name));
+  // Hiding every column would select nothing; read it as hiding none.
+  if (visible.length === 0) return "*";
+  return visible.map(ident).join(", ");
 }
 
 /// One page of table data. `ctid` rides field 0 as the row key, and one
@@ -126,22 +236,41 @@ export function orderSql(pkCols: readonly string[]): string {
 export function dataSql(
   schema: string,
   name: string,
-  filters: readonly Filter[],
+  query: TableQuery,
   pkCols: readonly string[],
   offset: number,
+  pageSize: number,
+  columns: readonly string[] = [],
 ): string {
   return (
-    `SELECT ctid, * FROM ${ident(schema)}.${ident(name)}` +
-    whereSql(filters) +
-    orderSql(pkCols) +
-    ` LIMIT ${PAGE_SIZE + 1} OFFSET ${offset};`
+    `SELECT ctid, ${projectionSql(columns, query.hidden)} FROM ${ident(schema)}.${ident(name)}` +
+    whereSql(query.where) +
+    orderSql(query.sort, pkCols) +
+    ` LIMIT ${pageSize + 1} OFFSET ${offset};`
+  );
+}
+
+/// The same query as you would write it by hand — no ctid, no paging. This
+/// is what the builder previews and what "Edit as SQL" hands to a query tab.
+export function plainSql(
+  schema: string,
+  name: string,
+  query: TableQuery,
+  pkCols: readonly string[],
+  columns: readonly string[] = [],
+): string {
+  return (
+    `SELECT ${projectionSql(columns, query.hidden)} FROM ${ident(schema)}.${ident(name)}` +
+    whereSql(query.where) +
+    orderSql(query.sort, pkCols) +
+    ";"
   );
 }
 
 /// A free-form SELECT wrapped for pagination (probe row included).
-export function wrapPaged(base: string, offset: number): string {
+export function wrapPaged(base: string, offset: number, pageSize: number): string {
   const trimmed = base.trim().replace(/;\s*$/, "");
-  return `SELECT * FROM (${trimmed}) AS artemis_page LIMIT ${PAGE_SIZE + 1} OFFSET ${offset};`;
+  return `SELECT * FROM (${trimmed}) AS artemis_page LIMIT ${pageSize + 1} OFFSET ${offset};`;
 }
 
 /// Whether a statement can be paginated by wrapping it in a subquery.
@@ -204,9 +333,11 @@ export function commitSql(
   schema: string,
   name: string,
   staged: readonly StagedEdit[],
-  filters: readonly Filter[],
+  query: TableQuery,
   pkCols: readonly string[],
   offset: number,
+  pageSize: number,
+  columns: readonly string[] = [],
 ): string {
   const byRow = new Map<string, StagedEdit[]>();
   for (const edit of staged) {
@@ -225,6 +356,6 @@ export function commitSql(
     );
   }
   statements.push("COMMIT;");
-  statements.push(dataSql(schema, name, filters, pkCols, offset));
+  statements.push(dataSql(schema, name, query, pkCols, offset, pageSize, columns));
   return statements.join(" ");
 }

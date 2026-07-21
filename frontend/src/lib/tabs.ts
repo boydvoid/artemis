@@ -7,7 +7,8 @@
 // discipline.
 
 import type { Page } from "./parse";
-import type { Filter, StagedEdit } from "./sql";
+import { DEFAULT_PAGE_SIZE } from "./sql";
+import type { StagedEdit, TableQuery } from "./sql";
 import type { TableRef } from "./parse";
 
 export const EMPTY_PAGE: Page = { cols: [], rows: [], keys: [], hasNext: false };
@@ -16,7 +17,16 @@ export const EMPTY_PAGE: Page = { cols: [], rows: [], keys: [], hasNext: false }
 /// re-run it.
 export type Source =
   | { kind: "none" }
-  | { kind: "table"; table: TableRef; pkCols: string[]; filters: Filter[] }
+  /// `columns` is the table's full column set, captured on open. The builder
+  /// needs it to offer a column it is currently hiding — the last page only
+  /// knows about the ones it selected.
+  | {
+      kind: "table";
+      table: TableRef;
+      pkCols: string[];
+      columns: string[];
+      query: TableQuery;
+    }
   | { kind: "sql"; sql: string };
 
 export interface QueryTab {
@@ -27,6 +37,10 @@ export interface QueryTab {
   source: Source;
   page: Page;
   pageIndex: number;
+  /// Rows per page, per tab. A single global would leave every other tab's
+  /// pageIndex pointing at an offset computed under the old size, so their
+  /// loaded rows would silently stop matching their page number.
+  pageSize: number;
   staged: StagedEdit[];
   /// Set when the tab came from (or was written to) a saved query, so Save
   /// updates in place instead of creating duplicates.
@@ -43,6 +57,7 @@ export function freshTab(id: number, name = `Query ${id}`): QueryTab {
     source: { kind: "none" },
     page: EMPTY_PAGE,
     pageIndex: 0,
+    pageSize: DEFAULT_PAGE_SIZE,
     staged: [],
     savedId: 0,
     status: "",

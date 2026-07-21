@@ -18,9 +18,10 @@
 // when the user commits the batch.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { TableProperties } from "lucide-react";
+import { ChevronDown, ChevronUp, TableProperties } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Page } from "@/lib/parse";
+import type { Sort } from "@/lib/sql";
 
 const MIN_COL_WIDTH = 84;
 /// Enough to show a UUID or timestamp in full without one wide column
@@ -38,6 +39,12 @@ interface Props {
   /// single row to write back to.
   editable: boolean;
   onStage: (rowIndex: number, colIndex: number, value: string) => void;
+  /// The active sort, in precedence order. Ordering is server-side, so this
+  /// only says how to draw the headers.
+  sort?: readonly Sort[];
+  /// Absent for a free-form query: there is no single table to re-order, and
+  /// the statement may carry its own ORDER BY. Headers stay inert then.
+  onSort?: (column: string, additive: boolean) => void;
 }
 
 /// A first-pass width from the widest sample in the column, clamped. Cheap
@@ -55,7 +62,15 @@ function autoWidth(col: string, rows: readonly string[][], index: number): numbe
   return Math.max(MIN_COL_WIDTH, Math.min(MAX_AUTO_WIDTH, estimate));
 }
 
-export default function DataGrid({ page, keyed, staged, editable, onStage }: Props) {
+export default function DataGrid({
+  page,
+  keyed,
+  staged,
+  editable,
+  onStage,
+  sort = [],
+  onSort,
+}: Props) {
   const [widths, setWidths] = useState<Record<string, number>>({});
   const [editing, setEditing] = useState<{ r: number; c: number } | null>(null);
   const [draft, setDraft] = useState("");
@@ -155,23 +170,55 @@ export default function DataGrid({ page, keyed, staged, editable, onStage }: Pro
             >
               {keyed ? "#" : "·"}
             </th>
-            {page.cols.map((col, i) => (
-              <th
-                key={col + i}
-                className="text-[11px] font-medium tracking-[0.03em] text-muted-foreground"
-                style={{ width: resolved[i], minWidth: resolved[i] }}
-              >
-                <span className="block overflow-hidden text-ellipsis" title={col}>
-                  {col}
-                </span>
-                <span
-                  className="col-resize"
-                  onMouseDown={(e) => startResize(e, col, resolved[i])}
-                  onDoubleClick={() => resetWidth(col)}
-                  title="Drag to resize · double-click to reset"
-                />
-              </th>
-            ))}
+            {page.cols.map((col, i) => {
+              const rank = sort.findIndex((entry) => entry.column === col);
+              const sorted = rank < 0 ? null : sort[rank];
+              return (
+                <th
+                  key={col + i}
+                  className="text-[11px] font-medium tracking-[0.03em] text-muted-foreground"
+                  style={{ width: resolved[i], minWidth: resolved[i] }}
+                  aria-sort={
+                    sorted ? (sorted.dir === "asc" ? "ascending" : "descending") : undefined
+                  }
+                >
+                  <span
+                    className={cn(
+                      "flex items-center gap-1 overflow-hidden",
+                      onSort && "cursor-pointer select-none hover:text-foreground",
+                    )}
+                    onClick={onSort ? (e) => onSort(col, e.shiftKey) : undefined}
+                    title={
+                      onSort
+                        ? `${col} · click to sort, shift-click to add to the sort`
+                        : col
+                    }
+                  >
+                    <span className="overflow-hidden text-ellipsis">{col}</span>
+                    {sorted && (
+                      <span className="flex flex-none items-center text-amber">
+                        {sorted.dir === "asc" ? (
+                          <ChevronUp className="size-3" />
+                        ) : (
+                          <ChevronDown className="size-3" />
+                        )}
+                        {/* The precedence number only earns its space once
+                            more than one column is in play. */}
+                        {sort.length > 1 && (
+                          <span className="text-[9px] leading-none">{rank + 1}</span>
+                        )}
+                      </span>
+                    )}
+                  </span>
+                  <span
+                    className="col-resize"
+                    onMouseDown={(e) => startResize(e, col, resolved[i])}
+                    onDoubleClick={() => resetWidth(col)}
+                    title="Drag to resize · double-click to reset"
+                  />
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>

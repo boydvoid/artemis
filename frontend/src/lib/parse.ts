@@ -8,7 +8,6 @@
 // because the grid renders both as a dimmed NULL marker.
 
 import { RS, US } from "./bridge";
-import { PAGE_SIZE } from "./sql";
 
 export interface TableRef {
   id: string;
@@ -55,7 +54,7 @@ export function parsePkCols(out: string): string[] {
 
 /// One page of results. `keyed` means the statement selected `ctid, *`,
 /// so field 0 is the row key rather than user data.
-export function parsePage(out: string, keyed: boolean, cap = PAGE_SIZE): Page {
+export function parsePage(out: string, keyed: boolean, cap: number): Page {
   const lines = records(out);
   if (lines.length === 0) return { cols: [], rows: [], keys: [], hasNext: false };
 
