@@ -68,6 +68,14 @@ export function parsePkCols(out: string): string[] {
   return cols;
 }
 
+/// A single count(*) value: record 0 is the header, record 1 the number.
+export function parseCount(out: string): number | null {
+  const lines = records(out);
+  if (lines.length < 2) return null;
+  const value = Number.parseInt(lines[1], 10);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 /// One page of results. `keyed` means the statement selected `ctid, *`,
 /// so field 0 is the row key rather than user data.
 export function parsePage(out: string, keyed: boolean, cap: number): Page {

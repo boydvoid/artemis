@@ -176,6 +176,76 @@
 
   /* Revealed on header hover only — 26 columns should not read as 26
      handles. */
+  /* The home screen reads as a powered instrument face, not a flat void:
+     a faint graph-paper grid and a warm phosphor bloom at the top, both
+     masked so they dissolve into the dark rather than tile edge to edge. */
+  .home-surface {
+    position: relative;
+    background:
+      radial-gradient(110% 60% at 50% -8%, rgba(255, 176, 0, 0.055), transparent 62%),
+      var(--background);
+  }
+  .home-surface::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--hairline) 1px, transparent 1px),
+      linear-gradient(90deg, var(--hairline) 1px, transparent 1px);
+    background-size: 46px 46px;
+    background-position: center top;
+    mask-image: radial-gradient(88% 72% at 50% 12%, #000 0%, transparent 78%);
+    opacity: 0.55;
+    pointer-events: none;
+  }
+  .home-surface > * {
+    position: relative;
+  }
+
+  /* One orchestrated reveal: each strip rises and its status LED powers on,
+     staggered by an inline animation-delay. */
+  @keyframes home-rise {
+    from {
+      opacity: 0;
+      transform: translateY(7px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .home-rise {
+    animation: home-rise 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  @keyframes led-power-on {
+    0% {
+      opacity: 0;
+      box-shadow: none;
+    }
+    55% {
+      opacity: 1;
+      box-shadow: 0 0 11px var(--amber);
+    }
+    100% {
+      box-shadow: 0 0 6px var(--ring);
+    }
+  }
+  .led-live {
+    background: var(--amber);
+    box-shadow: 0 0 6px var(--ring);
+    animation: led-power-on 0.7s ease-out both;
+  }
+
+  /* Engineering registration marks just outside a panel's corners. */
+  .reg-tick {
+    position: absolute;
+    width: 7px;
+    height: 7px;
+    border-color: color-mix(in oklch, var(--muted-foreground) 45%, transparent);
+    pointer-events: none;
+  }
+
   /* The query-in-flight strip: an amber trace sweeping the seam between
      the controls and the grid. Sized by its container (a fixed 2px slot in
      App), so appearing and disappearing never shifts layout. */

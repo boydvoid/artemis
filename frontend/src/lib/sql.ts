@@ -1,30 +1,17 @@
-// SQL construction, ported from the native app's src/pg.ts.
+// SQL construction.
 //
-// The native version threaded Uint8Array everywhere to satisfy the
-// app-core subset checker; here it is plain strings, but the statements
-// and the quoting rules are the same.
+// Structure is shared across engines; the per-engine pieces (row-key token,
+// catalog and pk queries, the `contains` operator) come in as a `Dialect` —
+// see ./db. Quoting is identical everywhere, so `ident`/`literal` live with
+// the dialect definitions and are re-used here.
+
+import { ident, literal, type Dialect } from "./db/dialect";
 
 /// Rows per page. 15 came over from the canvas app and made you page through
 /// anything real; 50 fills a window without making the +1 probe row costly.
 /// The size is per-tab — see QueryTab.pageSize.
 export const DEFAULT_PAGE_SIZE = 50;
 export const PAGE_SIZES: readonly number[] = [25, 50, 100, 250];
-
-/// A quoted identifier. Doubling embedded quotes is what makes a column
-/// literally named `we"ird` safe to interpolate.
-export function ident(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
-
-/// A quoted literal, same doubling rule for single quotes.
-export function literal(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-export const TABLES_SQL =
-  "SELECT table_schema, table_name FROM information_schema.tables " +
-  "WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema') " +
-  "ORDER BY table_schema, table_name;";
 
 export type FilterOp =
   | "eq"
@@ -137,7 +124,7 @@ export function opTakesValue(op: FilterOp): boolean {
 /// works on non-text columns too; the ordering operators compare in the
 /// column's own type, which is what makes `qty > 10` numeric rather than
 /// lexicographic.
-export function conditionSql(filter: Condition): string {
+export function conditionSql(filter: Condition, dialect: Dialect): string {
   const column = ident(filter.column);
   switch (filter.op) {
     case "eq":
@@ -153,7 +140,7 @@ export function conditionSql(filter: Condition): string {
     case "lte":
       return `${column} <= ${literal(filter.value)}`;
     case "contains":
-      return `${column}::text ILIKE ${literal(`%${filter.value}%`)}`;
+      return dialect.contains(column, filter.value);
     case "is_null":
       return `${column} IS NULL`;
     case "not_null":
@@ -164,13 +151,15 @@ export function conditionSql(filter: Condition): string {
 /// One node as SQL. Empty groups vanish rather than emitting `()`, and a
 /// group of one needs no parentheses — so a half-built tree still produces a
 /// statement that runs, which is what lets the preview update as you type.
-export function predicateSql(node: Predicate): string {
+export function predicateSql(node: Predicate, dialect: Dialect): string {
   if (node.kind === "condition") {
     if (opTakesValue(node.op) && node.value.length === 0) return "";
     if (node.column.length === 0) return "";
-    return conditionSql(node);
+    return conditionSql(node, dialect);
   }
-  const parts = node.children.map(predicateSql).filter((part) => part.length > 0);
+  const parts = node.children
+    .map((child) => predicateSql(child, dialect))
+    .filter((part) => part.length > 0);
   if (parts.length === 0) return "";
   if (parts.length === 1) return parts[0];
   return `(${parts.join(node.connective === "and" ? " AND " : " OR ")})`;
@@ -182,8 +171,10 @@ export function predicateSql(node: Predicate): string {
 /// clause is not wrapped in a redundant outer pair of parentheses — this SQL
 /// is read in the preview and handed to a query tab, so it should look like
 /// something a person would have written.
-export function whereSql(where: Group): string {
-  const parts = where.children.map(predicateSql).filter((part) => part.length > 0);
+export function whereSql(where: Group, dialect: Dialect): string {
+  const parts = where.children
+    .map((child) => predicateSql(child, dialect))
+    .filter((part) => part.length > 0);
   if (parts.length === 0) return "";
   const glue = where.connective === "and" ? " AND " : " OR ";
   return ` WHERE ${parts.join(glue)}`;
@@ -194,28 +185,22 @@ export function conditionLabel(filter: Condition): string {
   return `${filter.column} ${opLabel(filter.op)} ${filter.value}`;
 }
 
-/// Primary-key columns, one `pk:<name>` row each. The prefix keeps the
-/// result-set boundary unambiguous.
-export function pkSql(schema: string, name: string): string {
-  const qualified = `${ident(schema)}.${ident(name)}`;
-  return (
-    "SELECT 'pk:' || a.attname FROM pg_index i " +
-    "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) " +
-    `WHERE i.indrelid = ${literal(qualified)}::regclass AND i.indisprimary ORDER BY a.attnum;`
-  );
-}
-
 /// The user's sort, made total.
 ///
 /// Whatever they picked, the key always trails it: OFFSET pagination repeats
 /// and skips rows whenever the ordering leaves ties, so a sort on a column
-/// with duplicates is only safe with a unique tiebreaker behind it.
-export function orderSql(sort: readonly Sort[], pkCols: readonly string[]): string {
+/// with duplicates is only safe with a unique tiebreaker behind it. With no
+/// primary key the engine's implicit row id (ctid/rowid) is that tiebreaker.
+export function orderSql(
+  sort: readonly Sort[],
+  pkCols: readonly string[],
+  dialect: Dialect,
+): string {
   const parts = sort
     .filter((entry) => entry.column.length > 0)
     .map((entry) => `${ident(entry.column)} ${entry.dir === "desc" ? "DESC" : "ASC"}`);
   const chosen = new Set(sort.map((entry) => entry.column));
-  if (pkCols.length === 0) parts.push("ctid");
+  if (pkCols.length === 0) parts.push(dialect.rowKey);
   else for (const pk of pkCols) if (!chosen.has(pk)) parts.push(ident(pk));
   return ` ORDER BY ${parts.join(", ")}`;
 }
@@ -234,6 +219,7 @@ function projectionSql(columns: readonly string[], hidden: readonly string[]): s
 /// One page of table data. `ctid` rides field 0 as the row key, and one
 /// extra row probes for a next page without a COUNT.
 export function dataSql(
+  dialect: Dialect,
   schema: string,
   name: string,
   query: TableQuery,
@@ -243,9 +229,9 @@ export function dataSql(
   columns: readonly string[] = [],
 ): string {
   return (
-    `SELECT ctid, ${projectionSql(columns, query.hidden)} FROM ${ident(schema)}.${ident(name)}` +
-    whereSql(query.where) +
-    orderSql(query.sort, pkCols) +
+    `SELECT ${dialect.rowKey}, ${projectionSql(columns, query.hidden)} FROM ${ident(schema)}.${ident(name)}` +
+    whereSql(query.where, dialect) +
+    orderSql(query.sort, pkCols, dialect) +
     ` LIMIT ${pageSize + 1} OFFSET ${offset};`
   );
 }
@@ -253,6 +239,7 @@ export function dataSql(
 /// The same query as you would write it by hand — no ctid, no paging. This
 /// is what the builder previews and what "Edit as SQL" hands to a query tab.
 export function plainSql(
+  dialect: Dialect,
   schema: string,
   name: string,
   query: TableQuery,
@@ -261,10 +248,28 @@ export function plainSql(
 ): string {
   return (
     `SELECT ${projectionSql(columns, query.hidden)} FROM ${ident(schema)}.${ident(name)}` +
-    whereSql(query.where) +
-    orderSql(query.sort, pkCols) +
+    whereSql(query.where, dialect) +
+    orderSql(query.sort, pkCols, dialect) +
     ";"
   );
+}
+
+/// The filtered row count for a table view. Projection and sort cannot
+/// change it, so only the predicate tree rides along.
+export function countSql(
+  dialect: Dialect,
+  schema: string,
+  name: string,
+  query: TableQuery,
+): string {
+  return `SELECT count(*) FROM ${ident(schema)}.${ident(name)}${whereSql(query.where, dialect)};`;
+}
+
+/// The row count of a free-form SELECT — the same subquery pagination
+/// walks, so a statement with its own LIMIT counts what it can page over.
+export function wrapCount(base: string): string {
+  const trimmed = base.trim().replace(/;\s*$/, "");
+  return `SELECT count(*) FROM (${trimmed}) AS artemis_count;`;
 }
 
 /// A free-form SELECT wrapped for pagination (probe row included).
@@ -281,7 +286,7 @@ export function isPageable(sql: string): boolean {
 }
 
 export interface StagedEdit {
-  /// The row's ctid — the staging identity, stable within a page.
+  /// The row's ctid/rowid — the staging identity, stable within a page.
   key: string;
   column: string;
   colIndex: number;
@@ -298,15 +303,16 @@ export function stagedSqlValue(value: string): string {
 }
 
 /// How to address one row in an UPDATE. Primary key equality when every
-/// pk column is present in the result, ctid otherwise.
+/// pk column is present in the result, the engine's row id otherwise.
 ///
 /// `baseRow` must be the row's ORIGINAL values, not staged ones: editing
 /// a primary-key column must still match on the value the database holds.
 export function rowPredicate(
+  dialect: Dialect,
   pkCols: readonly string[],
   cols: readonly string[],
   baseRow: readonly string[],
-  ctid: string,
+  rowKeyValue: string,
 ): string {
   if (pkCols.length > 0) {
     const parts: string[] = [];
@@ -321,7 +327,7 @@ export function rowPredicate(
     }
     if (resolved && parts.length > 0) return parts.join(" AND ");
   }
-  return `ctid = ${literal(ctid)}`;
+  return `${dialect.rowKey} = ${literal(rowKeyValue)}`;
 }
 
 /// Staged edits as one atomic batch, followed by the page select so the
@@ -330,6 +336,7 @@ export function rowPredicate(
 /// All edits to one row collapse into a single UPDATE, so a multi-column
 /// edit of a row always lands together.
 export function commitSql(
+  dialect: Dialect,
   schema: string,
   name: string,
   staged: readonly StagedEdit[],
@@ -356,6 +363,6 @@ export function commitSql(
     );
   }
   statements.push("COMMIT;");
-  statements.push(dataSql(schema, name, query, pkCols, offset, pageSize, columns));
+  statements.push(dataSql(dialect, schema, name, query, pkCols, offset, pageSize, columns));
   return statements.join(" ");
 }

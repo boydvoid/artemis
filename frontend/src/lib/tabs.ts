@@ -37,6 +37,11 @@ export interface QueryTab {
   source: Source;
   page: Page;
   pageIndex: number;
+  /// Whether this tab's source has actually been run this session. A restored
+  /// tab has a source but no result yet; false is what triggers the one-time
+  /// re-run on arrival. NOT a proxy for "has rows" — an empty result (a table
+  /// with no rows) is still loaded, and confusing the two loops the re-run.
+  loaded: boolean;
   /// Rows per page, per tab. A single global would leave every other tab's
   /// pageIndex pointing at an offset computed under the old size, so their
   /// loaded rows would silently stop matching their page number.
@@ -45,6 +50,13 @@ export interface QueryTab {
   /// Set when the tab came from (or was written to) a saved query, so Save
   /// updates in place instead of creating duplicates.
   savedId: number;
+  /// Total rows the current source matches, from a best-effort count query.
+  /// null while unknown (still counting, count failed, or single-run).
+  total: number | null;
+  /// The count statement `total` answers. A late count only lands if the tab
+  /// still asks the same question — this is what keeps a slow count from a
+  /// superseded query off the footer.
+  countKey: string;
   status: string;
   elapsed: number;
 }
@@ -57,9 +69,12 @@ export function freshTab(id: number, name = `Query ${id}`): QueryTab {
     source: { kind: "none" },
     page: EMPTY_PAGE,
     pageIndex: 0,
+    loaded: false,
     pageSize: DEFAULT_PAGE_SIZE,
     staged: [],
     savedId: 0,
+    total: null,
+    countKey: "",
     status: "",
     elapsed: 0,
   };

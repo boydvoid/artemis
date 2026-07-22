@@ -54,6 +54,9 @@ const null_marker = "\x01";
 const ExecPayload = struct {
     url: []const u8,
     sql: []const u8,
+    /// Which client to shell out to: "postgres" (psql) or "sqlite" (sqlite3).
+    /// Defaults to postgres so a caller that omits it keeps the old behaviour.
+    driver: []const u8 = "postgres",
 };
 
 const StorePayload = struct {
@@ -293,6 +296,9 @@ const Job = struct {
     id_len: usize = 0,
     url: []u8 = &.{},
     sql: []u8 = &.{},
+    /// A `db` job against SQLite rather than Postgres. `store` jobs are always
+    /// SQLite and ignore this.
+    db_sqlite: bool = false,
 
     fn id(self: *const Job) []const u8 {
         return self.id_storage[0..self.id_len];
@@ -320,14 +326,21 @@ const Context = struct {
     completions: CompletionQueue = .{},
     stash: Stash = .{},
 
-    /// The platform's cross-thread nudge, captured at start. Stored as the
-    /// raw fn pointer so this file does not need the PlatformServices type.
-    wake_context: ?*anyopaque = null,
+    /// Platform services captured at start, as raw fn pointers so this file
+    /// need not name the PlatformServices type. `services_context` is the one
+    /// context every service fn takes; `wake_fn` is the cross-thread nudge,
+    /// `open_dialog_fn` the native file picker.
+    services_context: ?*anyopaque = null,
     wake_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    open_dialog_fn: ?*const fn (
+        ?*anyopaque,
+        native_sdk.OpenDialogOptions,
+        []u8,
+    ) anyerror!native_sdk.OpenDialogResult = null,
 
     fn wake(self: *Context) void {
         const wake_fn = self.wake_fn orelse return;
-        wake_fn(self.wake_context) catch {};
+        wake_fn(self.services_context) catch {};
     }
 
     // ---- async entry points (loop thread; must return fast)
@@ -351,6 +364,7 @@ const Context = struct {
 
         var url: []const u8 = "";
         var sql: []const u8 = "";
+        var db_sqlite = false;
         switch (kind) {
             .db => {
                 const parsed = std.json.parseFromSliceLeaky(
@@ -363,6 +377,7 @@ const Context = struct {
                 if (parsed.sql.len == 0) return respondError(responder, request_id, "missing sql");
                 url = parsed.url;
                 sql = parsed.sql;
+                db_sqlite = std.mem.eql(u8, parsed.driver, "sqlite");
             },
             .store => {
                 const parsed = std.json.parseFromSliceLeaky(
@@ -378,7 +393,7 @@ const Context = struct {
 
         const allocator = std.heap.page_allocator;
         const job = allocator.create(Job) catch return respondError(responder, request_id, "out of memory");
-        job.* = .{ .context = self, .kind = kind, .responder = responder };
+        job.* = .{ .context = self, .kind = kind, .responder = responder, .db_sqlite = db_sqlite };
         job.id_len = @min(request_id.len, job.id_storage.len);
         @memcpy(job.id_storage[0..job.id_len], request_id[0..job.id_len]);
         job.url = if (url.len > 0) allocator.dupe(u8, url) catch return failJob(job, "out of memory") else &.{};
@@ -447,26 +462,41 @@ const Context = struct {
     }
 
     fn runDb(job: *Job, arena: std.mem.Allocator) ExecResult {
+        // Same framing for both clients — US fields, RS records, 0x01 for
+        // NULL, a header record — so the TypeScript parser needs no branch.
+        // sqlite3: -header to always emit the header, -bail so a failed
+        // UPDATE in the commit batch stops before COMMIT (leaving the open
+        // transaction to roll back on exit), matching psql's ON_ERROR_STOP.
+        const psql_argv = [_][]const u8{
+            "psql",             job.url,           "-X",
+            "-q",               "-A",              "-F",
+            unit_separator,     "-R",              record_separator,
+            "-P",               "footer=off",      "-P",
+            "null=" ++ null_marker, "-v",          "ON_ERROR_STOP=1",
+            "-c",               job.sql,
+        };
+        // The URL is `sqlite:<path>`; sqlite3 wants the bare path.
+        const sqlite_prefix = "sqlite:";
+        const path = if (std.mem.startsWith(u8, job.url, sqlite_prefix))
+            job.url[sqlite_prefix.len..]
+        else
+            job.url;
+        const sqlite_argv = [_][]const u8{
+            "sqlite3",      "-batch",          "-bail",
+            "-header",      "-separator",      unit_separator,
+            "-newline",     record_separator,  "-nullvalue",
+            null_marker,    path,              job.sql,
+        };
+
+        const argv: []const []const u8 = if (job.db_sqlite) &sqlite_argv else &psql_argv;
+        const missing = if (job.db_sqlite)
+            "Could not run sqlite3 - install the SQLite command line tools."
+        else
+            "Could not run psql - install the PostgreSQL client tools.";
+
+        const started_ms = native_sdk.monotonicMs();
         const run = std.process.run(arena, job.context.io, .{
-            .argv = &.{
-                "psql",
-                job.url,
-                "-X",
-                "-q",
-                "-A",
-                "-F",
-                unit_separator,
-                "-R",
-                record_separator,
-                "-P",
-                "footer=off",
-                "-P",
-                "null=" ++ null_marker,
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                job.sql,
-            },
+            .argv = argv,
             .stdout_limit = .limited(max_stdout_bytes),
             .stderr_limit = .limited(max_stderr_bytes),
         }) catch |err| {
@@ -475,16 +505,23 @@ const Context = struct {
                 .code = -1,
                 .out = "",
                 .err = switch (err) {
-                    error.FileNotFound => "Could not run psql - install the PostgreSQL client tools.",
+                    error.FileNotFound => missing,
                     error.StreamTooLong => "Result exceeds the 8 MiB cap - narrow the query.",
                     else => @errorName(err),
                 },
             };
         };
+        const spawn_ms = native_sdk.monotonicMs() -| started_ms;
 
         const exited = run.term == .exited;
         const code: i32 = if (exited) @intCast(run.term.exited) else -1;
-        std.debug.print("db.exec: code={d} stdout={d}B stderr={d}B\n", .{ code, run.stdout.len, run.stderr.len });
+        std.debug.print("db.exec[{s}]: {d}ms code={d} stdout={d}B stderr={d}B\n", .{
+            if (job.db_sqlite) "sqlite" else "psql",
+            spawn_ms,
+            code,
+            run.stdout.len,
+            run.stderr.len,
+        });
 
         const fit = escapedFit(run.stdout, out_escaped_budget);
         if (fit >= run.stdout.len) {
@@ -582,6 +619,32 @@ const Context = struct {
 
         return self.stash.read(parsed.handle, parsed.offset, output);
     }
+
+    /// Open the native file picker for a SQLite database and return the chosen
+    /// path. Sync (loop thread) because the panel is a modal that blocks the
+    /// UI by design — which is exactly what an async worker must never do.
+    /// Cancel, or a platform with no picker, answers `{ "path": null }`.
+    fn pickFile(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *Context = @ptrCast(@alignCast(context));
+        _ = invocation;
+
+        const open_fn = self.open_dialog_fn orelse
+            return writeJson(output, .{ .path = @as(?[]const u8, null) });
+
+        const filters = [_]native_sdk.FileFilter{
+            .{ .name = "SQLite database", .extensions = &.{ "db", "sqlite", "sqlite3", "db3" } },
+        };
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const result = open_fn(self.services_context, .{
+            .title = "Choose a SQLite database",
+            .filters = &filters,
+        }, &path_buffer) catch
+            return writeJson(output, .{ .path = @as(?[]const u8, null) });
+
+        // Single-selection: `paths` is one path with no separator.
+        const chosen: ?[]const u8 = if (result.count > 0 and result.paths.len > 0) result.paths else null;
+        return writeJson(output, .{ .path = chosen });
+    }
 };
 
 const App = struct {
@@ -612,8 +675,9 @@ const App = struct {
     fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context));
         const services = runtime.options.platform.services;
-        self.bridge_context.wake_context = services.context;
+        self.bridge_context.services_context = services.context;
         self.bridge_context.wake_fn = services.wake_fn;
+        self.bridge_context.open_dialog_fn = services.show_open_dialog_fn;
     }
 
     /// `.effects_wake` is the contract: a worker called `wake`, so there
@@ -638,6 +702,7 @@ const bridge_commands = [_]native_sdk.bridge.CommandPolicy{
     .{ .name = "db.exec", .origins = &dev_origins },
     .{ .name = "db.chunk", .origins = &dev_origins },
     .{ .name = "store.exec", .origins = &dev_origins },
+    .{ .name = "dialog.pickFile", .origins = &dev_origins },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -654,6 +719,7 @@ pub fn main(init: std.process.Init) !void {
 
     const sync_handlers = [_]native_sdk.BridgeHandler{
         .{ .name = "db.chunk", .context = &context, .invoke_fn = Context.chunkRead },
+        .{ .name = "dialog.pickFile", .context = &context, .invoke_fn = Context.pickFile },
     };
     const async_handlers = [_]native_sdk.bridge.AsyncHandler{
         .{ .name = "db.exec", .context = &context, .invoke_fn = Context.execStart },

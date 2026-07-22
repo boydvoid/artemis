@@ -60,11 +60,16 @@ async function invoke(command: string, payload: unknown): Promise<ExecResult> {
   }
 }
 
-/// Run SQL against a connected Postgres database (psql, native side).
+/// Run SQL against a connected database. `driver` picks the native client
+/// (`postgres` → psql, `sqlite` → sqlite3); `url` is that connection's URL.
 /// Oversized results come back in chunks; they are reassembled here so
 /// every caller keeps seeing one complete ExecResult.
-export async function exec(url: string, sql: string): Promise<ExecResult> {
-  const first = (await invoke("db.exec", { url, sql })) as ChunkedExecResult;
+export async function exec(
+  url: string,
+  sql: string,
+  driver = "postgres",
+): Promise<ExecResult> {
+  const first = (await invoke("db.exec", { url, sql, driver })) as ChunkedExecResult;
   const base: ExecResult = {
     ok: first.ok,
     code: first.code,
@@ -102,6 +107,19 @@ export async function exec(url: string, sql: string): Promise<ExecResult> {
     return { ...base, ok: false, out: "", err: message };
   }
   return { ...base, out };
+}
+
+/// Open the native file picker for a SQLite database. Resolves to the chosen
+/// absolute path, or null if cancelled or unavailable (no shell / no picker).
+export async function pickSqliteFile(): Promise<string | null> {
+  const api = zero();
+  if (!api) return null;
+  try {
+    const result = await api.invoke<{ path: string | null }>("dialog.pickFile");
+    return result.path ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /// Run SQL against the app's own SQLite store (sqlite3, native side).

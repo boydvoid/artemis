@@ -31,19 +31,20 @@ import {
   type Connection,
   type SavedQuery,
 } from "@/lib/store";
-import { editText, parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
+import { editText, parseCount, parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
+import { dialectForUrl } from "@/lib/db";
 import { clearSession, hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
 import {
   DEFAULT_PAGE_SIZE,
   PAGE_SIZES,
-  TABLES_SQL,
   commitSql,
+  countSql,
   dataSql,
   emptyQuery,
   isPageable,
-  pkSql,
   plainSql,
   rowPredicate,
+  wrapCount,
   wrapPaged,
   type Sort,
   type TableQuery,
@@ -101,6 +102,10 @@ export default function App() {
     () => connections.find((c) => c.id === activeId) ?? null,
     [connections, activeId],
   );
+  /// The active connection's dialect. Every SQL builder and the bridge driver
+  /// key off this, so switching connections switches engines transparently.
+  /// With no connection it falls back to Postgres, which never runs.
+  const dialect = useMemo(() => dialectForUrl(active?.url ?? ""), [active]);
   const tab = useMemo(() => tabById(tabs, activeTabId) ?? tabs[0], [tabs, activeTabId]);
 
   /// Staged values indexed for the grid: `${ctid}:${colIndex}`.
@@ -172,7 +177,7 @@ export default function App() {
       const started = performance.now();
       setBusyCount((count) => count + 1);
       try {
-        const result = await exec(active.url, statement);
+        const result = await exec(active.url, statement, dialectForUrl(active.url).driver);
         const ms = Math.round(performance.now() - started);
         if (!result.ok) {
           // psql's own message is far more useful than anything we could
@@ -190,13 +195,35 @@ export default function App() {
   );
 
   const loadTables = useCallback(async () => {
-    const result = await run(TABLES_SQL);
+    const result = await run(dialect.tablesSql);
     if (result === null) {
       setTables([]);
       return;
     }
     setTables(parseTables(result.out));
-  }, [run]);
+  }, [run, dialect]);
+
+  /// Best-effort total for the footer, deliberately OUTSIDE `run()`: it never
+  /// touches the busy state (the rows are already on screen — a count on a
+  /// large table can be slow, and decoration must not block the instrument),
+  /// and a failure just means no total is shown. A late result only lands if
+  /// the tab still asks the same count statement — superseded by key, so a
+  /// slow count from an abandoned query never mislabels a newer result.
+  const refreshCount = useCallback(
+    (tabId: number, statement: string) => {
+      if (!active) return;
+      setTabs((prev) => withTab(prev, tabId, { total: null, countKey: statement }));
+      void exec(active.url, statement, dialectForUrl(active.url).driver).then((result) => {
+        if (!result.ok) return;
+        const total = parseCount(result.out);
+        if (total === null) return;
+        setTabs((prev) =>
+          prev.map((t) => (t.id === tabId && t.countKey === statement ? { ...t, total } : t)),
+        );
+      });
+    },
+    [active],
+  );
 
   // The review panel only has a reason to exist while there are edits to
   // review — an empty batch (committed, discarded, or all removed) closes it.
@@ -298,13 +325,14 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [booted, activeId, screen, tabs, activeTabId, nextTabId, editorHeight]);
 
-  // A restored tab carries a query but no rows — results are not persisted.
+  // A restored tab carries a query but no result — results are not persisted.
   // Run it the first time you actually look at it, which covers the active tab
   // at startup and the others as you reach them, without firing every tab's
-  // query at once. A source with no columns only ever means "restored, not yet
-  // run": switching connections clears the source outright.
+  // query at once. `loaded` is the signal, NOT column count: an empty result
+  // (e.g. a SQLite table with no rows, which prints no header) has zero
+  // columns yet is fully loaded — keying on columns would re-run it forever.
   useEffect(() => {
-    if (!active || tab.source.kind === "none" || tab.page.cols.length > 0) return;
+    if (!active || tab.source.kind === "none" || tab.loaded) return;
     void goToPage(0);
     // Keyed on the tab OBJECT, not its kind: switching connections swaps in a
     // hydrated tab whose kind can equal the old one's, and that swap must
@@ -324,7 +352,7 @@ export default function App() {
       return;
     }
 
-    const pkResult = await run(pkSql(table.schema, table.name));
+    const pkResult = await run(dialect.pkSql(table.schema, table.name));
     // No primary key is fine — orderSql falls back to ctid.
     const pkCols = pkResult === null ? [] : parsePkCols(pkResult.out);
     // Taking over the tab in front of you inherits its page size; a brand new
@@ -335,7 +363,7 @@ export default function App() {
     const size = pristine ? tab.pageSize : DEFAULT_PAGE_SIZE;
 
     const query = emptyQuery();
-    const statement = dataSql(table.schema, table.name, query, pkCols, 0, size);
+    const statement = dataSql(dialect, table.schema, table.name, query, pkCols, 0, size);
     const result = await run(statement);
     if (result === null) return;
 
@@ -343,12 +371,13 @@ export default function App() {
     // set — the one chance to capture it before the builder starts hiding.
     const page = parsePage(result.out, true, size);
 
-    const loaded = {
+    const loadedTab = {
       name: table.name,
       sql: statement,
       source: { kind: "table" as const, table, pkCols, columns: page.cols, query },
       page,
       pageIndex: 0,
+      loaded: true,
       pageSize: size,
       staged: [],
       status: `${table.schema}.${table.name}`,
@@ -359,15 +388,17 @@ export default function App() {
     // its own document now — opening one must not eat a query you were
     // writing, or the filters on the table already there.
     if (pristine) {
-      patchTab(loaded);
+      patchTab(loadedTab);
+      refreshCount(tab.id, countSql(dialect, table.schema, table.name, query));
       return;
     }
 
-    const created: QueryTab = { ...freshTab(nextTabId), ...loaded };
+    const created: QueryTab = { ...freshTab(nextTabId), ...loadedTab };
     setTabs((prev) => [...prev, created]);
     setActiveTabId(created.id);
     setNextTabId((n) => n + 1);
     setSaveName(null);
+    refreshCount(created.id, countSql(dialect, table.schema, table.name, query));
   }
 
   /// Re-run the current table at page 0 under a new query. Every part of the
@@ -383,7 +414,12 @@ export default function App() {
   async function applyQuery(next: TableQuery, keepStaged = false) {
     if (tab.source.kind !== "table") return;
     const { table, pkCols, columns } = tab.source;
+    // Sort and projection cannot change how many rows match; only a changed
+    // predicate is worth a fresh count (which can be a slow seq scan).
+    const whereChanged =
+      JSON.stringify(next.where) !== JSON.stringify(tab.source.query.where);
     const statement = dataSql(
+      dialect,
       table.schema,
       table.name,
       next,
@@ -399,9 +435,11 @@ export default function App() {
       source: { kind: "table", table, pkCols, columns, query: next },
       page: parsePage(result.out, true, tab.pageSize),
       pageIndex: 0,
+      loaded: true,
       staged: keepStaged ? tab.staged : [],
       elapsed: result.ms,
     });
+    if (whereChanged) refreshCount(tab.id, countSql(dialect, table.schema, table.name, next));
   }
 
   /// Header click cycles that column asc → desc → unsorted. A plain click
@@ -437,10 +475,15 @@ export default function App() {
       source: pageable ? { kind: "sql", sql: statement } : { kind: "none" },
       page: parsePage(result.out, false, tab.pageSize),
       pageIndex: 0,
+      loaded: true,
       staged: [],
+      // A single-run statement has no result set to count.
+      total: null,
+      countKey: "",
       status: pageable ? "query" : "query (single run)",
       elapsed: result.ms,
     });
+    if (pageable) refreshCount(tab.id, wrapCount(statement));
   }
 
   /// Move to a page, optionally resizing it. Changing the size goes through
@@ -458,6 +501,7 @@ export default function App() {
     const statement =
       source.kind === "table"
         ? dataSql(
+            dialect,
             source.table.schema,
             source.table.name,
             source.query,
@@ -472,11 +516,23 @@ export default function App() {
     patchTab({
       page: parsePage(result.out, source.kind === "table", size),
       pageIndex: next,
+      loaded: true,
       pageSize: size,
       staged: [],
       elapsed: result.ms,
       ...(source.kind === "table" ? { sql: statement } : {}),
     });
+    // Page moves and resizes do not change the total — the whole point of
+    // remembering it. An unknown total means a restored tab running for the
+    // first time this session, which is the one case worth a count here.
+    if (tab.total === null) {
+      refreshCount(
+        tab.id,
+        source.kind === "table"
+          ? countSql(dialect, source.table.schema, source.table.name, source.query)
+          : wrapCount(source.sql),
+      );
+    }
   }
 
   /// Record an edit against the row's ORIGINAL values. Re-editing the same
@@ -502,7 +558,7 @@ export default function App() {
               column: tab.page.cols[colIndex],
               colIndex,
               value,
-              where: rowPredicate(source.pkCols, tab.page.cols, tab.page.rows[rowIndex], key),
+              where: rowPredicate(dialect, source.pkCols, tab.page.cols, tab.page.rows[rowIndex], key),
             },
           ],
     });
@@ -511,6 +567,7 @@ export default function App() {
   async function commitStaged() {
     if (tab.source.kind !== "table" || tab.staged.length === 0) return;
     const statement = commitSql(
+      dialect,
       tab.source.table.schema,
       tab.source.table.name,
       tab.staged,
@@ -528,9 +585,15 @@ export default function App() {
     patchTab({
       staged: [],
       page: parsePage(result.out, true, tab.pageSize),
+      loaded: true,
       status: `committed ${count} edit${count === 1 ? "" : "s"}`,
       elapsed: result.ms,
     });
+    // An UPDATE can move rows out of (or into) the filtered set.
+    refreshCount(
+      tab.id,
+      countSql(dialect, tab.source.table.schema, tab.source.table.name, tab.source.query),
+    );
   }
 
   // ---- tabs
@@ -661,7 +724,7 @@ export default function App() {
     const { table, pkCols, columns } = tab.source;
     const created: QueryTab = {
       ...freshTab(nextTabId, table.name),
-      sql: plainSql(table.schema, table.name, query, pkCols, columns),
+      sql: plainSql(dialect, table.schema, table.name, query, pkCols, columns),
     };
     setTabs((prev) => [...prev, created]);
     setActiveTabId(created.id);
@@ -747,6 +810,7 @@ export default function App() {
             buildSql={(q) =>
               tab.source.kind === "table"
                 ? plainSql(
+                    dialect,
                     tab.source.table.schema,
                     tab.source.table.name,
                     q,
@@ -825,6 +889,7 @@ export default function App() {
             sort={tab.source.kind === "table" ? tab.source.query.sort : []}
             onSort={tab.source.kind === "table" ? toggleSort : undefined}
             busy={busy}
+            ranEmpty={tab.loaded && tab.source.kind !== "none"}
             suppressInspector={showCommit}
             onRowClick={() => setShowCommit(false)}
           />
@@ -859,6 +924,7 @@ export default function App() {
               </span>
               <span className="text-faint">
                 {firstRow}–{lastRow}
+                {tab.total !== null && ` of ${tab.total.toLocaleString()}`}
               </span>
             </>
           )}

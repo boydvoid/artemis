@@ -1,7 +1,7 @@
 # Artemis
 
-A desktop Postgres browser. React in the system WebView, Zig native shell,
-no Electron.
+A desktop database browser — PostgreSQL and SQLite. React in the system
+WebView, Zig native shell, no Electron.
 
 Browse tables, run SQL, filter and edit rows. Built around a data grid that
 does the thing every terminal client makes hard: **wide tables stay
@@ -92,13 +92,24 @@ it lives in WebView localStorage (`frontend/src/lib/session.ts`) and losing
 it costs a re-open of a table, nothing more.
 
 ```
-React  ──  window.zero.invoke("db.exec",    { url, sql })  ──▶  psql     (a connected database)
-       ──  window.zero.invoke("store.exec", { sql })       ──▶  sqlite3  (the app's own state)
-       ◀──  { ok, code, out, err, truncated }  ─────────────────┘
+React  ──  db.exec    { url, sql, driver }  ──▶  psql / sqlite3  (a connected database)
+       ──  store.exec  { sql }               ──▶  sqlite3         (the app's own state)
+       ◀──  { ok, code, out, err, truncated }  ───────────────────┘
 ```
 
 Both commands share one contract: send SQL, get raw framed stdout back, and
 a failing statement is *data* (`ok:false` plus stderr), not a bridge fault.
+
+`db.exec` speaks to more than one engine. A connection's dialect is a pure
+function of its URL — `sqlite:<path>` is SQLite, anything else Postgres — so
+adding SQLite needed no schema change; the `url` column already said it. The
+web layer sends a `driver` and `main.zig` routes it to `psql` or `sqlite3`,
+each invoked with flags that produce the **same** framing (US fields, RS
+records, `0x01` for NULL, a header record), so the TypeScript parser is
+engine-blind. What little SQL genuinely differs — the row-identity token
+(`ctid` / `rowid`), the catalog and primary-key queries, and the `contains`
+operator (`ILIKE` vs `CAST … LIKE`) — comes from a small `Dialect`
+(`frontend/src/lib/db/`); the builders in `sql.ts` are one shared body.
 
 Queries run **off the loop thread**: `db.exec` and `store.exec` are async
 bridge handlers, so a slow query never freezes the window. The handler
@@ -123,14 +134,13 @@ relative path would silently create a different, empty database in each.
 Set `ARTEMIS_DB` to point it elsewhere — that is how you share one file
 with the canvas app, which still uses its own `legacy/.artemis/artemis.db`.
 
-`out` is raw psql stdout in unit/record-separator framing
-(`-A -F <US> -R <RS>`), the same format the native app used, plus
-`-P null=<0x01>` so SQL `NULL` arrives as a marker byte and is finally
-distinguishable from an empty string. All parsing
-happens in TypeScript (`frontend/src/lib/parse.ts`), all SQL construction
-in `frontend/src/lib/sql.ts` — both ported from `legacy/src/pg.ts` and
-`legacy/src/core.ts`. `src/main.zig` builds no SQL and interprets no results;
-it is a pipe.
+`out` is raw client stdout in unit/record-separator framing
+(`-A -F <US> -R <RS>` for psql, `-separator/-newline` for sqlite3), with a
+`0x01` NULL marker so SQL `NULL` is finally distinguishable from an empty
+string. All parsing happens in TypeScript (`frontend/src/lib/parse.ts`),
+all SQL construction in `frontend/src/lib/sql.ts` (parameterized by the
+dialect). `src/main.zig` builds no SQL and interprets no results; it is a
+pipe that picks a client.
 
 The bridge is deny-by-default: only `db.exec` and `store.exec` are
 registered, each reachable only from the origins listed in `main.zig`.
@@ -141,8 +151,9 @@ registered, each reachable only from the origins listed in `main.zig`.
 | --- | --- |
 | `src/main.zig` | shell + the `db.exec` and `store.exec` handlers |
 | `frontend/src/lib/bridge.ts` | the one seam to native |
-| `frontend/src/lib/sql.ts` | SQL construction, quoting, the predicate tree, pagination |
-| `frontend/src/lib/parse.ts` | psql framed-output parsing |
+| `frontend/src/lib/db/` | dialects: what differs per engine, and URL→dialect |
+| `frontend/src/lib/sql.ts` | SQL construction (dialect-parameterized), predicate tree, pagination |
+| `frontend/src/lib/parse.ts` | framed-output parsing (engine-blind) |
 | `frontend/src/lib/store.ts` | app state via `store.exec` (SQLite) |
 | `frontend/src/lib/session.ts` | workspace restore (localStorage — the one exception) |
 | `frontend/src/lib/pgurl.ts` | connection URL ⇄ fields conversion |
@@ -203,7 +214,8 @@ session to restore, launching lands on Home.
 Connections (add, open, delete, persisted), table browser with filter,
 Monaco SQL editor, a query builder on table tabs, keyed table views ordered
 by primary key (ctid fallback), column-header sorting, OFFSET pagination
-with a probe row and a page-size picker (25/50/100/250, per tab), psql
+with a probe row and a page-size picker (25/50/100/250, per tab), a
+best-effort total row count in the footer next to the pager, psql
 errors surfaced verbatim, session restore on reopen, and a results grid
 with real per-column min-widths, horizontal scroll, a pinned header and row
 gutter, and drag-resizable columns (double-click a divider to reset).
@@ -320,9 +332,15 @@ open tab intact, just no longer linked.
 
 ## Known limitations
 
-- Results are capped at 8 MiB of psql stdout per query; up to that they
+- Results are capped at 8 MiB of client stdout per query; up to that they
   arrive whole (chunked across bridge responses when large), beyond it the
   query fails with a clear message.
+- SQLite: an empty table shows a "No rows." state without its column headers —
+  the `sqlite3` CLI prints no header for an empty result, unlike psql, so the
+  columns are unknown until a row exists. Non-empty tables, filters, sort,
+  paging, editing and counts all work.
+- SQLite connections are a local file path (`sqlite:<path>`), typed in;
+  there is no native file picker yet.
 - A NULL marker byte (0x01) distinguishes SQL `NULL` from an empty string.
   A value that genuinely contains a literal 0x01 byte would be misread as
   NULL — the same class of assumption the US/RS framing already makes.

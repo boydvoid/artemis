@@ -55,6 +55,10 @@ interface Props {
   /// the OLD result, and pretending otherwise would invite edits against
   /// rows about to be replaced (interaction is disabled while dimmed).
   busy?: boolean;
+  /// The source ran and simply matched nothing (vs. nothing has run yet). An
+  /// empty result carries no columns to draw, so the empty state has to say
+  /// which of the two it is.
+  ranEmpty?: boolean;
   /// The right edge is shared with the commit panel: when it owns that space
   /// the inspector is hidden and its selection cleared, so closing the commit
   /// panel does not pop a stale inspector back open.
@@ -88,6 +92,7 @@ export default function DataGrid({
   sort = [],
   onSort,
   busy = false,
+  ranEmpty = false,
   suppressInspector = false,
   onRowClick,
 }: Props) {
@@ -198,7 +203,11 @@ export default function DataGrid({
           strokeWidth={1.5}
         />
         <p className={cn("text-[12.5px]", busy && "animate-pulse")}>
-          {busy ? "running query\u2026" : "Run a query or pick a table."}
+          {busy
+            ? "running query\u2026"
+            : ranEmpty
+              ? "No rows."
+              : "Run a query or pick a table."}
         </p>
       </div>
     );
