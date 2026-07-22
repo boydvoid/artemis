@@ -6,7 +6,8 @@
 // connection is what opens the workspace.
 
 import { useState } from "react";
-import { Check, Circle, Database, Plus, Trash2 } from "lucide-react";
+import { Check, Circle, Plus, Trash2 } from "lucide-react";
+import Logo from "@/components/Logo";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -63,7 +64,7 @@ export default function Connections(props: Props) {
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="mx-auto w-full max-w-[760px] px-8 py-14">
         <header className="mb-10 flex items-center gap-3">
-          <Database className="size-5 text-amber" />
+          <Logo className="h-6 w-auto text-amber" />
           <div>
             <h1 className="text-[15px] font-semibold tracking-[0.18em]">ARTEMIS</h1>
             <p className="mt-0.5 font-mono text-[11.5px] text-muted-foreground">
