@@ -3,35 +3,33 @@
 // The whole UI is React (frontend/), served from frontend/dist in
 // production and from the Vite dev server under `zig build dev`. The
 // native side owns exactly one capability the browser cannot have:
-// running SQL through the PostgreSQL client CLI. React calls it as
+// running SQL. React calls it as
 //
-//     await window.zero.invoke("db.exec", { url, sql })
+//     await window.zero.invoke("db.exec", { url, sql, driver })
 //     -> { ok, code, out, err }
 //
-// `out` is raw psql stdout in the same unit/record-separator framing the
-// native app used (-A -F <US> -R <RS>), so the TypeScript side keeps
-// doing all parsing. This shell stays a dumb pipe on purpose: no SQL is
-// built here, and no result is interpreted here.
+// The databases are spoken to natively — SQLite through the linked library
+// (sqlite.zig) and Postgres over its wire protocol (postgres.zig) — so the
+// app depends on no `psql`/`sqlite3` binary and nothing on PATH. Both
+// engines produce the SAME unit/record-separator framing (-A -F <US> -R
+// <RS>, 0x01 for NULL, header record 0), so the TypeScript side parses
+// engine-blind. This shell stays a dumb pipe on purpose: no SQL is built
+// here, and no result is interpreted here.
 //
 // Queries run OFF the loop thread. `db.exec` and `store.exec` are async
 // bridge handlers: the handler copies the request and spawns a worker,
-// the worker runs the subprocess and queues the finished response, then
-// nudges the platform loop (`services.wake`, the one service any thread
-// may call). The loop thread drains the queue on `.effects_wake` and
-// completes the bridge there — WebKit only tolerates being spoken to
-// from the main thread, so the worker never touches the responder.
+// the worker runs the query and queues the finished response, then nudges
+// the platform loop (`services.wake`, the one service any thread may
+// call). The loop thread drains the queue on `.effects_wake` and completes
+// the bridge there — WebKit only tolerates being spoken to from the main
+// thread, so the worker never touches the responder.
 const std = @import("std");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
+const sqlite = @import("sqlite.zig");
+const postgres = @import("postgres.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
-
-/// psql stdout cap. A page is at most a few hundred rows, but a single
-/// text column can be large; 8 MiB is far above any page. Results larger
-/// than one bridge response are delivered in chunks (below), so this cap
-/// is the honest end of the line, reported as `truncated`.
-const max_stdout_bytes: usize = 8 * 1024 * 1024;
-const max_stderr_bytes: usize = 64 * 1024;
 
 /// One bridge response is capped at 1 MiB by the SDK (max_response_bytes),
 /// and JSON escaping can grow a control byte to six (`US`). So the
@@ -39,17 +37,6 @@ const max_stderr_bytes: usize = 64 * 1024;
 /// worst-case escaped stderr still fits the envelope. Anything larger is
 /// stashed whole and the web layer pulls the rest through `db.chunk`.
 const out_escaped_budget: usize = 560 * 1024;
-
-const unit_separator = "\x1f";
-const record_separator = "\x1e";
-
-/// What psql prints for SQL NULL (`-P null=`). Text output cannot
-/// otherwise distinguish NULL from the empty string — both print as
-/// nothing — so NULL gets a marker from the same C0 range the field and
-/// record separators already claim. The web layer maps it back; data
-/// containing a literal 0x01 would confuse it, the same class of
-/// assumption the framing itself already makes.
-const null_marker = "\x01";
 
 const ExecPayload = struct {
     url: []const u8,
@@ -462,137 +449,81 @@ const Context = struct {
     }
 
     fn runDb(job: *Job, arena: std.mem.Allocator) ExecResult {
-        // Same framing for both clients — US fields, RS records, 0x01 for
-        // NULL, a header record — so the TypeScript parser needs no branch.
-        // sqlite3: -header to always emit the header, -bail so a failed
-        // UPDATE in the commit batch stops before COMMIT (leaving the open
-        // transaction to roll back on exit), matching psql's ON_ERROR_STOP.
-        const psql_argv = [_][]const u8{
-            "psql",             job.url,           "-X",
-            "-q",               "-A",              "-F",
-            unit_separator,     "-R",              record_separator,
-            "-P",               "footer=off",      "-P",
-            "null=" ++ null_marker, "-v",          "ON_ERROR_STOP=1",
-            "-c",               job.sql,
-        };
-        // The URL is `sqlite:<path>`; sqlite3 wants the bare path.
+        if (job.db_sqlite) return runSqlite(job, arena);
+        return runPostgres(job, arena);
+    }
+
+    /// SQLite, through the linked library — no `sqlite3` binary. `sqlite.exec`
+    /// frames its output exactly as the CLI did (US fields, RS records, 0x01
+    /// NULL, a header record), so the result flows through the same
+    /// size/stash contract as every other db path.
+    fn runSqlite(job: *Job, arena: std.mem.Allocator) ExecResult {
+        // The URL is `sqlite:<path>`; the library wants the bare path.
         const sqlite_prefix = "sqlite:";
         const path = if (std.mem.startsWith(u8, job.url, sqlite_prefix))
             job.url[sqlite_prefix.len..]
         else
             job.url;
-        const sqlite_argv = [_][]const u8{
-            "sqlite3",      "-batch",          "-bail",
-            "-header",      "-separator",      unit_separator,
-            "-newline",     record_separator,  "-nullvalue",
-            null_marker,    path,              job.sql,
-        };
-
-        const argv: []const []const u8 = if (job.db_sqlite) &sqlite_argv else &psql_argv;
-        const missing = if (job.db_sqlite)
-            "Could not run sqlite3 - install the SQLite command line tools."
-        else
-            "Could not run psql - install the PostgreSQL client tools.";
 
         const started_ms = native_sdk.monotonicMs();
-        const run = std.process.run(arena, job.context.io, .{
-            .argv = argv,
-            .stdout_limit = .limited(max_stdout_bytes),
-            .stderr_limit = .limited(max_stderr_bytes),
-        }) catch |err| {
-            return .{
-                .ok = false,
-                .code = -1,
-                .out = "",
-                .err = switch (err) {
-                    error.FileNotFound => missing,
-                    error.StreamTooLong => "Result exceeds the 8 MiB cap - narrow the query.",
-                    else => @errorName(err),
-                },
-            };
-        };
-        const spawn_ms = native_sdk.monotonicMs() -| started_ms;
+        const result = sqlite.exec(arena, path, job.sql, true);
+        const elapsed_ms = native_sdk.monotonicMs() -| started_ms;
+        std.debug.print("db.exec[sqlite]: {d}ms code={d} out={d}B\n", .{ elapsed_ms, result.code, result.out.len });
 
-        const exited = run.term == .exited;
-        const code: i32 = if (exited) @intCast(run.term.exited) else -1;
-        std.debug.print("db.exec[{s}]: {d}ms code={d} stdout={d}B stderr={d}B\n", .{
-            if (job.db_sqlite) "sqlite" else "psql",
-            spawn_ms,
-            code,
-            run.stdout.len,
-            run.stderr.len,
-        });
+        return job.context.finish(result.out, result.code, result.err);
+    }
 
-        const fit = escapedFit(run.stdout, out_escaped_budget);
-        if (fit >= run.stdout.len) {
-            return .{
-                .ok = exited and code == 0,
-                .code = code,
-                .out = run.stdout,
-                .err = run.stderr,
-            };
+    /// Postgres, over the v3 wire protocol — no `psql` binary. `postgres.exec`
+    /// connects, authenticates (SCRAM/MD5/cleartext), honours the URL's
+    /// sslmode, and frames rows exactly as sqlite.exec does, so the result
+    /// flows through the same size/stash contract.
+    fn runPostgres(job: *Job, arena: std.mem.Allocator) ExecResult {
+        const started_ms = native_sdk.monotonicMs();
+        const result = postgres.exec(arena, job.context.io, job.url, job.sql);
+        const elapsed_ms = native_sdk.monotonicMs() -| started_ms;
+        std.debug.print("db.exec[postgres]: {d}ms code={d} out={d}B\n", .{ elapsed_ms, result.code, result.out.len });
+
+        return job.context.finish(result.out, result.code, result.err);
+    }
+
+    /// Fit a framed result into one bridge response, or stash it whole and
+    /// send the first chunk with a handle for the rest. Shared by every db
+    /// path so the size contract lives in one place; `ok` is simply a
+    /// zero exit code (psql sets -1 when it never exited).
+    fn finish(self: *Context, out: []const u8, code: i32, err: []const u8) ExecResult {
+        const ok = code == 0;
+        const fit = escapedFit(out, out_escaped_budget);
+        if (fit >= out.len) {
+            return .{ .ok = ok, .code = code, .out = out, .err = err };
         }
-
-        // Too big for one response: stash the whole thing and send the
-        // first chunk with a handle for the rest. Only a failed stash
-        // falls back to honest truncation.
-        const handle = job.context.stash.put(run.stdout) catch 0;
+        // Only a failed stash falls back to honest truncation.
+        const handle = self.stash.put(out) catch 0;
         return .{
-            .ok = exited and code == 0,
+            .ok = ok,
             .code = code,
-            .out = run.stdout[0..fit],
-            .err = run.stderr,
+            .out = out[0..fit],
+            .err = err,
             .truncated = handle == 0,
             .more = if (handle == 0) null else .{
                 .handle = handle,
                 .next = fit,
-                .total = run.stdout.len,
+                .total = out.len,
             },
         };
     }
 
-    /// The app's own state, through `sqlite3`. Same contract as `db.exec`:
-    /// the web layer sends SQL, gets framed stdout back, and a failing
-    /// statement is data rather than a bridge fault.
+    /// The app's own state, through the linked SQLite library — same as
+    /// `db.exec`'s SQLite path, so the store no longer depends on a `sqlite3`
+    /// binary either. The web layer sends SQL, gets framed output back, and a
+    /// failing statement is data rather than a bridge fault.
     fn runStore(job: *Job, arena: std.mem.Allocator) ExecResult {
-        // sqlite3 creates the database file but not its directory.
+        // The library creates the database file but not its directory.
         if (std.fs.path.dirname(job.context.store_path)) |dir| {
             std.Io.Dir.cwd().createDirPath(job.context.io, dir) catch {};
         }
 
-        const run = std.process.run(arena, job.context.io, .{
-            .argv = &.{
-                "sqlite3",
-                "-batch",
-                "-separator",
-                unit_separator,
-                "-newline",
-                record_separator,
-                job.context.store_path,
-                job.sql,
-            },
-            .stdout_limit = .limited(max_stdout_bytes),
-            .stderr_limit = .limited(max_stderr_bytes),
-        }) catch |err| {
-            return .{
-                .ok = false,
-                .code = -1,
-                .out = "",
-                .err = switch (err) {
-                    error.FileNotFound => "Could not run sqlite3 - install the SQLite command line tools.",
-                    else => @errorName(err),
-                },
-            };
-        };
-
-        const exited = run.term == .exited;
-        const code: i32 = if (exited) @intCast(run.term.exited) else -1;
-        return .{
-            .ok = exited and code == 0,
-            .code = code,
-            .out = run.stdout,
-            .err = run.stderr,
-        };
+        const result = sqlite.exec(arena, job.context.store_path, job.sql, false);
+        return job.context.finish(result.out, result.code, result.err);
     }
 
     fn buildEnvelope(arena: std.mem.Allocator, request_id: []const u8, result: ExecResult) ![]const u8 {

@@ -337,6 +337,12 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         }
         if (b.sysroot) |sysroot| {
             app_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+            // The SDK's usr/lib is where libsqlite3's .tbd stub lives; without
+            // it on the library search path the -lsqlite3 link finds nothing.
+            // With a sysroot set, zig resolves an absolute -L against it
+            // (and leaves a relative one cwd-relative), so "/usr/lib" lands
+            // on the SDK's <sysroot>/usr/lib where the stub lives.
+            app_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
         }
         app_mod.linkFramework("AppKit", .{});
         app_mod.linkFramework("AVFoundation", .{});
@@ -349,6 +355,11 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         app_mod.linkFramework("Metal", .{});
         app_mod.linkFramework("QuartzCore", .{});
         app_mod.linkSystemLibrary("c", .{});
+        // The database driver: libsqlite3 is a guaranteed macOS system
+        // library (the SDK ships its .tbd stub), so linking it needs no
+        // vendored source and no install — the app talks to SQLite directly
+        // instead of shelling out to a `sqlite3` binary that may be absent.
+        app_mod.linkSystemLibrary("sqlite3", .{});
         if (web_engine == .chromium) app_mod.linkSystemLibrary("c++", .{});
     } else if (platform == .linux) {
         switch (web_engine) {

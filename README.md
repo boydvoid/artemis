@@ -19,11 +19,12 @@ row gutter, drag-resizable columns.
 |---|---|---|
 | **macOS or Linux** | | Windows is untested |
 | **[Native SDK CLI](https://native-sdk.dev)** | `npm i -g @native-sdk/cli` | provides `native`, and Zig 0.16 |
-| **`psql`** | PostgreSQL client tools | how queries actually run |
-| **`sqlite3`** | usually preinstalled on macOS | stores your connections |
 | **Node 20+** | | builds the frontend |
 
-Check the first two with `native doctor`.
+Check the SDK with `native doctor`. **No database client tools are
+required** — Artemis talks to SQLite through the OS's own libsqlite3 and to
+Postgres over the wire protocol directly, so there is no `psql` or `sqlite3`
+binary to install and nothing to find on your PATH.
 
 ## Quick start
 
@@ -92,30 +93,37 @@ it lives in WebView localStorage (`frontend/src/lib/session.ts`) and losing
 it costs a re-open of a table, nothing more.
 
 ```
-React  ──  db.exec    { url, sql, driver }  ──▶  psql / sqlite3  (a connected database)
-       ──  store.exec  { sql }               ──▶  sqlite3         (the app's own state)
-       ◀──  { ok, code, out, err, truncated }  ───────────────────┘
+React  ──  db.exec    { url, sql, driver }  ──▶  libsqlite3 / pg wire  (a connected database)
+       ──  store.exec  { sql }               ──▶  libsqlite3            (the app's own state)
+       ◀──  { ok, code, out, err, truncated }  ─────────────────────────┘
 ```
 
-Both commands share one contract: send SQL, get raw framed stdout back, and
-a failing statement is *data* (`ok:false` plus stderr), not a bridge fault.
+Both commands share one contract: send SQL, get raw framed output back, and
+a failing statement is *data* (`ok:false` plus the error), not a bridge fault.
+
+The databases are spoken to **natively** — no client binary is invoked.
+SQLite goes through the OS's linked libsqlite3 (`src/sqlite.zig`); Postgres
+goes over its v3 wire protocol on a plain socket (`src/postgres.zig`),
+including TLS (honouring the URL's `sslmode`) and the auth methods a real
+server hands out — SCRAM-SHA-256, MD5, and cleartext. So the app needs no
+`psql` or `sqlite3` on the machine and nothing on PATH.
 
 `db.exec` speaks to more than one engine. A connection's dialect is a pure
 function of its URL — `sqlite:<path>` is SQLite, anything else Postgres — so
 adding SQLite needed no schema change; the `url` column already said it. The
-web layer sends a `driver` and `main.zig` routes it to `psql` or `sqlite3`,
-each invoked with flags that produce the **same** framing (US fields, RS
-records, `0x01` for NULL, a header record), so the TypeScript parser is
-engine-blind. What little SQL genuinely differs — the row-identity token
-(`ctid` / `rowid`), the catalog and primary-key queries, and the `contains`
-operator (`ILIKE` vs `CAST … LIKE`) — comes from a small `Dialect`
-(`frontend/src/lib/db/`); the builders in `sql.ts` are one shared body.
+web layer sends a `driver` and `main.zig` routes it to the SQLite or Postgres
+driver, each producing the **same** framing (US fields, RS records, `0x01`
+for NULL, a header record), so the TypeScript parser is engine-blind. What
+little SQL genuinely differs — the row-identity token (`ctid` / `rowid`), the
+catalog and primary-key queries, and the `contains` operator (`ILIKE` vs
+`CAST … LIKE`) — comes from a small `Dialect` (`frontend/src/lib/db/`); the
+builders in `sql.ts` are one shared body.
 
 Queries run **off the loop thread**: `db.exec` and `store.exec` are async
 bridge handlers, so a slow query never freezes the window. The handler
-copies the request and spawns a worker; the worker runs the subprocess and
-nudges the platform loop, which completes the bridge response on the loop
-thread — the only thread the WebView may be spoken to from.
+copies the request and spawns a worker; the worker runs the query and nudges
+the platform loop, which completes the bridge response on the loop thread —
+the only thread the WebView may be spoken to from.
 
 A result too large for one bridge response (the SDK caps a response at
 1 MiB) is stashed native-side and delivered in pieces: the first reply
@@ -134,8 +142,8 @@ relative path would silently create a different, empty database in each.
 Set `ARTEMIS_DB` to point it elsewhere — that is how you share one file
 with the canvas app, which still uses its own `legacy/.artemis/artemis.db`.
 
-`out` is raw client stdout in unit/record-separator framing
-(`-A -F <US> -R <RS>` for psql, `-separator/-newline` for sqlite3), with a
+`out` is raw framed output in unit/record-separator framing (US fields, RS
+records — the same bytes psql's `-A -F <US> -R <RS>` produced), with a
 `0x01` NULL marker so SQL `NULL` is finally distinguishable from an empty
 string. All parsing happens in TypeScript (`frontend/src/lib/parse.ts`),
 all SQL construction in `frontend/src/lib/sql.ts` (parameterized by the
@@ -215,7 +223,7 @@ Connections (add, open, delete, persisted), table browser with filter,
 Monaco SQL editor, a query builder on table tabs, keyed table views ordered
 by primary key (ctid fallback), column-header sorting, OFFSET pagination
 with a probe row and a page-size picker (25/50/100/250, per tab), a
-best-effort total row count in the footer next to the pager, psql
+best-effort total row count in the footer next to the pager, database
 errors surfaced verbatim, session restore on reopen, and a results grid
 with real per-column min-widths, horizontal scroll, a pinned header and row
 gutter, and drag-resizable columns (double-click a divider to reset).
@@ -332,15 +340,10 @@ open tab intact, just no longer linked.
 
 ## Known limitations
 
-- Results are capped at 8 MiB of client stdout per query; up to that they
-  arrive whole (chunked across bridge responses when large), beyond it the
-  query fails with a clear message.
-- SQLite: an empty table shows a "No rows." state without its column headers —
-  the `sqlite3` CLI prints no header for an empty result, unlike psql, so the
-  columns are unknown until a row exists. Non-empty tables, filters, sort,
-  paging, editing and counts all work.
-- SQLite connections are a local file path (`sqlite:<path>`), typed in;
-  there is no native file picker yet.
+- A query result is built in memory and delivered whole, chunked across
+  bridge responses when it is larger than one response holds. Browsing is
+  paged, so this is rarely near a limit; an unbounded `SELECT *` is bounded
+  only by available memory.
 - A NULL marker byte (0x01) distinguishes SQL `NULL` from an empty string.
   A value that genuinely contains a literal 0x01 byte would be misread as
   NULL — the same class of assumption the US/RS framing already makes.
