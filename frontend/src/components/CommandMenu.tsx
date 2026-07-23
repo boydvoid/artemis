@@ -1,5 +1,6 @@
 import {
   ArrowLeft,
+  Bot,
   Check,
   Database,
   Play,
@@ -43,6 +44,7 @@ export interface CommandMenuActions {
   closeTab: (id: number) => void;
   commit: () => void;
   discard: () => void;
+  toggleChat: () => void;
 }
 
 interface CommandMenuProps {
@@ -97,6 +99,11 @@ export default function CommandMenu(props: CommandMenuProps) {
             <CommandItem value="act:reload" keywords={["reload", "refresh", "tables", "schema"]} onSelect={run(actions.reloadTables)}>
               <RefreshCw />
               Reload tables
+            </CommandItem>
+            <CommandItem value="act:chat" keywords={["chat", "ai", "ollama", "assistant", "ask"]} onSelect={run(actions.toggleChat)}>
+              <Bot />
+              Toggle AI chat
+              <CommandShortcut>⌘J</CommandShortcut>
             </CommandItem>
             {props.hasStaged && (
               <>

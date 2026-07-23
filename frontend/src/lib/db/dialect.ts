@@ -35,6 +35,11 @@ export interface Dialect {
   rowKey: string;
   /// Lists browsable tables as `(table_schema, table_name)` records.
   tablesSql: string;
+  /// Lists every column of every browsable table as
+  /// `(table_schema, table_name, column_name, data_type)` records, in table
+  /// then ordinal order. Feeds the AI chat's schema context so it never
+  /// invents column names.
+  columnsSql: string;
   /// Primary-key columns of one table, each emitted as a `pk:<name>` record
   /// so the shared parser reads them the same way for every engine.
   pkSql(schema: string, name: string): string;

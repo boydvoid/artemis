@@ -28,6 +28,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const sqlite = @import("sqlite.zig");
 const postgres = @import("postgres.zig");
+const ollama = @import("ollama.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -54,6 +55,29 @@ const ChunkPayload = struct {
     handle: u64,
     offset: u64,
 };
+
+/// `ollama.tags` — just the endpoint to query.
+const OllamaTagsPayload = struct {
+    url: []const u8 = "",
+};
+
+/// `ollama.chat` — `body` is the exact JSON to POST to /api/chat (built on
+/// the web side, so this shell stays a dumb pipe: it constructs no request
+/// and interprets no reply). `id` correlates the streamed token events and
+/// is the handle `ollama.cancel` uses to stop the request.
+const OllamaChatPayload = struct {
+    url: []const u8 = "",
+    body: []const u8 = "",
+    id: []const u8 = "",
+};
+
+/// `ollama.cancel` — the stream id to abort.
+const OllamaCancelPayload = struct {
+    id: []const u8 = "",
+};
+
+/// Longest stream id we track. The web side sends a short token.
+const max_stream_id: usize = 64;
 
 /// Where the app's own state lives: saved connections and saved queries,
 /// in the same SQLite schema the canvas app used.
@@ -269,7 +293,150 @@ const CompletionQueue = struct {
     }
 };
 
-const JobKind = enum { db, store };
+/// One WebView event waiting for the loop thread. `emit_window_event_fn`,
+/// like the bridge responder, may only be called on the loop thread, so a
+/// streaming token takes the same road as a finished query: the worker
+/// queues it and nudges the loop, which drains and emits. `detail` is
+/// page_allocator-owned JSON, freed by the loop after it emits.
+const EventEntry = struct {
+    name: []const u8,
+    detail: []u8,
+};
+
+const EventQueue = struct {
+    /// Roomy: a fast model streams many small tokens between loop ticks.
+    /// When it does fill, the worker backpressures rather than dropping.
+    const capacity = 512;
+
+    mutex: SpinMutex = .{},
+    entries: [capacity]?EventEntry = [_]?EventEntry{null} ** capacity,
+
+    fn tryPush(self: *EventQueue, entry: EventEntry) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| {
+            if (slot.* == null) {
+                slot.* = entry;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Move everything out under the lock, emit outside it — emitting walks
+    /// into platform code, and holding a mutex across that invites deadlock.
+    fn drain(self: *EventQueue, context: *Context) void {
+        var pending: [capacity]EventEntry = undefined;
+        var count: usize = 0;
+        self.mutex.lock();
+        for (&self.entries) |*slot| {
+            if (slot.*) |entry| {
+                pending[count] = entry;
+                count += 1;
+                slot.* = null;
+            }
+        }
+        self.mutex.unlock();
+
+        for (pending[0..count]) |entry| {
+            context.emitEvent(entry.name, entry.detail);
+            std.heap.page_allocator.free(entry.detail);
+        }
+    }
+};
+
+/// In-flight chat requests, so `ollama.cancel` can stop one by its stream id.
+/// Slots are fixed and their addresses stable, so a worker holds a `*Slot`
+/// for the life of its request and polls the atomic without the mutex.
+const ChatRegistry = struct {
+    const capacity = 8;
+    const Slot = struct {
+        active: bool = false,
+        cancel: std.atomic.Value(bool) = .init(false),
+        id: [max_stream_id]u8 = undefined,
+        id_len: usize = 0,
+    };
+
+    mutex: SpinMutex = .{},
+    slots: [capacity]Slot = [_]Slot{.{}} ** capacity,
+
+    /// Claim a free slot for `id`, or null when all are busy — in which case
+    /// the chat still runs, just without a cancel handle.
+    fn acquire(self: *ChatRegistry, id: []const u8) ?*Slot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.slots) |*slot| {
+            if (!slot.active) {
+                slot.active = true;
+                slot.cancel.store(false, .seq_cst);
+                slot.id_len = @min(id.len, max_stream_id);
+                @memcpy(slot.id[0..slot.id_len], id[0..slot.id_len]);
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    fn release(self: *ChatRegistry, slot: *Slot) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        slot.active = false;
+    }
+
+    /// Flag the request with this id (if still running) for cancellation.
+    fn cancel(self: *ChatRegistry, id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.slots) |*slot| {
+            if (slot.active and std.mem.eql(u8, slot.id[0..slot.id_len], id)) {
+                slot.cancel.store(true, .seq_cst);
+            }
+        }
+    }
+};
+
+/// The token sink's context for one streaming chat: where to queue events,
+/// which stream id to tag them with, and the cancel flag to poll. Lives on
+/// the worker's stack for the request's duration.
+const StreamCtx = struct {
+    context: *Context,
+    slot: ?*ChatRegistry.Slot,
+    stream_id: []const u8,
+};
+
+/// Sink callback: queue one token as an `ollama.token` event and nudge the
+/// loop. Backpressures when the queue is full so no token is ever dropped —
+/// a dropped delta would silently corrupt the reply.
+fn emitToken(ctx_ptr: *anyopaque, delta: []const u8) void {
+    const sc: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    const page = std.heap.page_allocator;
+
+    // `{ "id": "...", "delta": "..." }`, JSON-escaped. Control bytes cost 6,
+    // so budget the delta at ×6 plus room for the id and the frame.
+    const scratch = page.alloc(u8, delta.len * 6 + sc.stream_id.len + 64) catch return;
+    defer page.free(scratch);
+    const detail = writeJson(scratch, .{ .id = sc.stream_id, .delta = delta }) catch return;
+    const owned = page.dupe(u8, detail) catch return;
+
+    const entry = EventEntry{ .name = "ollama.token", .detail = owned };
+    while (!sc.context.events.tryPush(entry)) {
+        // Queue full: wake the loop to drain it, yield, and retry the SAME
+        // entry (still owns `owned`, so nothing leaks and nothing is lost).
+        sc.context.wake();
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    sc.context.wake();
+}
+
+/// Sink callback: has this stream been cancelled? A missing slot (registry
+/// was full) simply never cancels.
+fn isCancelled(ctx_ptr: *anyopaque) bool {
+    const sc: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    const slot = sc.slot orelse return false;
+    return slot.cancel.load(.seq_cst);
+}
+
+const JobKind = enum { db, store, ollama_tags, ollama_chat };
 
 /// Everything a worker needs, copied out of the invocation — the request
 /// bytes belong to the platform and die when the handler returns. Owned by
@@ -286,9 +453,16 @@ const Job = struct {
     /// A `db` job against SQLite rather than Postgres. `store` jobs are always
     /// SQLite and ignore this.
     db_sqlite: bool = false,
+    /// The web-chosen stream id for an `ollama_chat` job (empty otherwise).
+    stream_id_storage: [max_stream_id]u8 = undefined,
+    stream_id_len: usize = 0,
 
     fn id(self: *const Job) []const u8 {
         return self.id_storage[0..self.id_len];
+    }
+
+    fn streamId(self: *const Job) []const u8 {
+        return self.stream_id_storage[0..self.stream_id_len];
     }
 
     fn destroy(self: *Job) void {
@@ -312,11 +486,14 @@ const Context = struct {
 
     completions: CompletionQueue = .{},
     stash: Stash = .{},
+    events: EventQueue = .{},
+    chats: ChatRegistry = .{},
 
     /// Platform services captured at start, as raw fn pointers so this file
     /// need not name the PlatformServices type. `services_context` is the one
     /// context every service fn takes; `wake_fn` is the cross-thread nudge,
-    /// `open_dialog_fn` the native file picker.
+    /// `open_dialog_fn` the native file picker, `emit_event_fn` the
+    /// WebView-bound event push that carries streamed tokens.
     services_context: ?*anyopaque = null,
     wake_fn: ?*const fn (?*anyopaque) anyerror!void = null,
     open_dialog_fn: ?*const fn (
@@ -324,10 +501,23 @@ const Context = struct {
         native_sdk.OpenDialogOptions,
         []u8,
     ) anyerror!native_sdk.OpenDialogResult = null,
+    emit_event_fn: ?*const fn (
+        ?*anyopaque,
+        native_sdk.WindowId,
+        []const u8,
+        []const u8,
+    ) anyerror!void = null,
 
     fn wake(self: *Context) void {
         const wake_fn = self.wake_fn orelse return;
         wake_fn(self.services_context) catch {};
+    }
+
+    /// Push a `native-sdk:<name>` CustomEvent to the main window's WebView.
+    /// The web layer subscribes with `window.zero.on(name, ...)`.
+    fn emitEvent(self: *Context, name: []const u8, detail_json: []const u8) void {
+        const emit_fn = self.emit_event_fn orelse return;
+        emit_fn(self.services_context, 1, name, detail_json) catch {};
     }
 
     // ---- async entry points (loop thread; must return fast)
@@ -342,6 +532,16 @@ const Context = struct {
         self.startJob(.store, invocation, responder);
     }
 
+    fn ollamaTagsStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation, responder: native_sdk.bridge.AsyncResponder) anyerror!void {
+        const self: *Context = @ptrCast(@alignCast(context));
+        self.startJob(.ollama_tags, invocation, responder);
+    }
+
+    fn ollamaChatStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation, responder: native_sdk.bridge.AsyncResponder) anyerror!void {
+        const self: *Context = @ptrCast(@alignCast(context));
+        self.startJob(.ollama_chat, invocation, responder);
+    }
+
     fn startJob(self: *Context, kind: JobKind, invocation: native_sdk.bridge.Invocation, responder: native_sdk.bridge.AsyncResponder) void {
         const request_id = invocation.request.id;
 
@@ -351,6 +551,7 @@ const Context = struct {
 
         var url: []const u8 = "";
         var sql: []const u8 = "";
+        var stream_id: []const u8 = "";
         var db_sqlite = false;
         switch (kind) {
             .db => {
@@ -376,6 +577,29 @@ const Context = struct {
                 if (parsed.sql.len == 0) return respondError(responder, request_id, "missing sql");
                 sql = parsed.sql;
             },
+            // The endpoint may be empty — the native client fills Ollama's
+            // default (127.0.0.1:11434), so a caller need only override it.
+            .ollama_tags => {
+                const parsed = std.json.parseFromSliceLeaky(
+                    OllamaTagsPayload,
+                    arena,
+                    invocation.request.payload,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return respondError(responder, request_id, "invalid payload");
+                url = parsed.url;
+            },
+            .ollama_chat => {
+                const parsed = std.json.parseFromSliceLeaky(
+                    OllamaChatPayload,
+                    arena,
+                    invocation.request.payload,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return respondError(responder, request_id, "invalid payload");
+                if (parsed.body.len == 0) return respondError(responder, request_id, "missing body");
+                url = parsed.url;
+                sql = parsed.body;
+                stream_id = parsed.id;
+            },
         }
 
         const allocator = std.heap.page_allocator;
@@ -383,8 +607,10 @@ const Context = struct {
         job.* = .{ .context = self, .kind = kind, .responder = responder, .db_sqlite = db_sqlite };
         job.id_len = @min(request_id.len, job.id_storage.len);
         @memcpy(job.id_storage[0..job.id_len], request_id[0..job.id_len]);
+        job.stream_id_len = @min(stream_id.len, max_stream_id);
+        @memcpy(job.stream_id_storage[0..job.stream_id_len], stream_id[0..job.stream_id_len]);
         job.url = if (url.len > 0) allocator.dupe(u8, url) catch return failJob(job, "out of memory") else &.{};
-        job.sql = allocator.dupe(u8, sql) catch return failJob(job, "out of memory");
+        job.sql = if (sql.len > 0) allocator.dupe(u8, sql) catch return failJob(job, "out of memory") else &.{};
 
         const thread = std.Thread.spawn(.{}, workerMain, .{job}) catch return failJob(job, "could not start a worker thread");
         thread.detach();
@@ -421,6 +647,8 @@ const Context = struct {
         const result = switch (job.kind) {
             .db => runDb(job, arena_state.allocator()),
             .store => runStore(job, arena_state.allocator()),
+            .ollama_tags => runOllamaTags(job, arena_state.allocator()),
+            .ollama_chat => runOllamaChat(job, arena_state.allocator()),
         };
 
         const envelope = buildEnvelope(arena_state.allocator(), job.id(), result) catch {
@@ -526,6 +754,39 @@ const Context = struct {
         return job.context.finish(result.out, result.code, result.err);
     }
 
+    /// GET the local model list. The whole JSON body comes back in `out` and
+    /// flows through `finish` like any other result — the web layer parses
+    /// Ollama's `{ "models": [...] }` shape itself.
+    fn runOllamaTags(job: *Job, arena: std.mem.Allocator) ExecResult {
+        const result = ollama.tags(arena, job.context.io, job.url);
+        return job.context.finish(result.out, result.code, result.err);
+    }
+
+    /// Stream a chat completion. Every token is emitted to the WebView as it
+    /// arrives (see `emitToken`); the bridge response is only the terminal
+    /// signal — `ok`/`err` — because the reply text is already on the web
+    /// side, assembled from the token events. That is what keeps a long
+    /// reply off the 1 MiB response budget entirely.
+    fn runOllamaChat(job: *Job, arena: std.mem.Allocator) ExecResult {
+        const slot = job.context.chats.acquire(job.streamId());
+        defer if (slot) |s| job.context.chats.release(s);
+
+        var stream_ctx = StreamCtx{
+            .context = job.context,
+            .slot = slot,
+            .stream_id = job.streamId(),
+        };
+        const sink = ollama.Sink{
+            .context = &stream_ctx,
+            .emit = emitToken,
+            .cancelled = isCancelled,
+        };
+        const result = ollama.chat(arena, job.context.io, job.url, job.sql, sink);
+        // The reply text rode the token stream; the response carries only the
+        // outcome. `finish` on an empty `out` fits one response trivially.
+        return job.context.finish("", result.code, result.err);
+    }
+
     fn buildEnvelope(arena: std.mem.Allocator, request_id: []const u8, result: ExecResult) ![]const u8 {
         const result_buffer = try arena.alloc(u8, native_sdk.bridge.max_result_bytes);
         const result_json = try writeJson(result_buffer, result);
@@ -549,6 +810,25 @@ const Context = struct {
         ) catch return error.InvalidPayload;
 
         return self.stash.read(parsed.handle, parsed.offset, output);
+    }
+
+    /// Flag a streaming chat for cancellation. Sync (loop thread): it only
+    /// sets an atomic the worker polls, so there is nothing to run off-loop.
+    fn ollamaCancel(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *Context = @ptrCast(@alignCast(context));
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+
+        const parsed = std.json.parseFromSliceLeaky(
+            OllamaCancelPayload,
+            arena_state.allocator(),
+            invocation.request.payload,
+            .{ .ignore_unknown_fields = true },
+        ) catch return error.InvalidPayload;
+
+        if (parsed.id.len > 0) self.chats.cancel(parsed.id);
+        return writeJson(output, .{ .ok = true });
     }
 
     /// Open the native file picker for a SQLite database and return the chosen
@@ -609,15 +889,22 @@ const App = struct {
         self.bridge_context.services_context = services.context;
         self.bridge_context.wake_fn = services.wake_fn;
         self.bridge_context.open_dialog_fn = services.show_open_dialog_fn;
+        self.bridge_context.emit_event_fn = services.emit_window_event_fn;
     }
 
-    /// `.effects_wake` is the contract: a worker called `wake`, so there
-    /// is at least one finished query to hand to the WebView.
+    /// `.effects_wake` is the contract: a worker called `wake`, so there is
+    /// at least one streamed token or finished query to hand to the WebView.
+    /// Events drain BEFORE completions: a chat's tokens are queued strictly
+    /// before its terminal response, so this order guarantees the web side
+    /// never sees "done" ahead of the last token.
     fn onEvent(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
         _ = runtime;
         const self: *@This() = @ptrCast(@alignCast(context));
         switch (event) {
-            .effects_wake => self.bridge_context.completions.drain(),
+            .effects_wake => {
+                self.bridge_context.events.drain(self.bridge_context);
+                self.bridge_context.completions.drain();
+            },
             else => {},
         }
     }
@@ -634,6 +921,9 @@ const bridge_commands = [_]native_sdk.bridge.CommandPolicy{
     .{ .name = "db.chunk", .origins = &dev_origins },
     .{ .name = "store.exec", .origins = &dev_origins },
     .{ .name = "dialog.pickFile", .origins = &dev_origins },
+    .{ .name = "ollama.tags", .origins = &dev_origins },
+    .{ .name = "ollama.chat", .origins = &dev_origins },
+    .{ .name = "ollama.cancel", .origins = &dev_origins },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -651,10 +941,13 @@ pub fn main(init: std.process.Init) !void {
     const sync_handlers = [_]native_sdk.BridgeHandler{
         .{ .name = "db.chunk", .context = &context, .invoke_fn = Context.chunkRead },
         .{ .name = "dialog.pickFile", .context = &context, .invoke_fn = Context.pickFile },
+        .{ .name = "ollama.cancel", .context = &context, .invoke_fn = Context.ollamaCancel },
     };
     const async_handlers = [_]native_sdk.bridge.AsyncHandler{
         .{ .name = "db.exec", .context = &context, .invoke_fn = Context.execStart },
         .{ .name = "store.exec", .context = &context, .invoke_fn = Context.storeStart },
+        .{ .name = "ollama.tags", .context = &context, .invoke_fn = Context.ollamaTagsStart },
+        .{ .name = "ollama.chat", .context = &context, .invoke_fn = Context.ollamaChatStart },
     };
     const dispatcher = native_sdk.BridgeDispatcher{
         .policy = .{ .enabled = true, .commands = &bridge_commands },

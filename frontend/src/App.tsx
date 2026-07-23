@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, RefreshCw, Save, Trash2, X } from "lucide-react";
+import ChatPanel from "@/components/ChatPanel";
 import CommandMenu from "@/components/CommandMenu";
 import CommitPanel from "@/components/CommitPanel";
 import Connections from "@/components/Connections";
@@ -32,8 +33,23 @@ import {
   type Connection,
   type SavedQuery,
 } from "@/lib/store";
-import { editText, parseCount, parsePage, parsePkCols, parseTables, type TableRef } from "@/lib/parse";
+import {
+  editText,
+  parseColumns,
+  parseCount,
+  parsePage,
+  parsePkCols,
+  parseTables,
+  type SchemaColumns,
+  type TableRef,
+} from "@/lib/parse";
 import { dialectForUrl } from "@/lib/db";
+import {
+  loadAiSettings,
+  saveEndpoint as storeSaveEndpoint,
+  saveModel as storeSaveModel,
+} from "@/lib/aiStore";
+import { DEFAULT_ENDPOINT } from "@/lib/ollama";
 import { clearSession, hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
 import {
   DEFAULT_PAGE_SIZE,
@@ -67,6 +83,9 @@ export default function App() {
   const [draftUrl, setDraftUrl] = useState("");
 
   const [tables, setTables] = useState<TableRef[]>([]);
+  // Columns per table (`schema.name` → columns), loaded best-effort for the
+  // AI chat's schema context so it never invents column names.
+  const [schema, setSchema] = useState<SchemaColumns>(new Map());
   const [tableFilter, setTableFilter] = useState("");
   const [saved, setSaved] = useState<SavedQuery[]>([]);
 
@@ -82,6 +101,12 @@ export default function App() {
   const [showCommit, setShowCommit] = useState(false);
   // The ⌘K command palette.
   const [commandOpen, setCommandOpen] = useState(false);
+
+  // The AI chat panel and its Ollama settings. Endpoint and model persist in
+  // the store like any other preference; the panel owns the conversation.
+  const [showChat, setShowChat] = useState(false);
+  const [aiEndpoint, setAiEndpoint] = useState(DEFAULT_ENDPOINT);
+  const [aiModel, setAiModel] = useState("");
 
   /// Queries can overlap — opening a restored workspace starts the catalog
   /// load and the active tab's first run together — so busy is a count, not
@@ -131,14 +156,17 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [rows, savedRows, activeConn] = await Promise.all([
+        const [rows, savedRows, activeConn, ai] = await Promise.all([
           loadConnections(),
           loadSavedQueries(),
           loadActiveId(),
+          loadAiSettings(),
         ]);
         if (cancelled) return;
         setConnections(rows);
         setSaved(savedRows);
+        setAiEndpoint(ai.endpoint);
+        setAiModel(ai.model);
 
         const known = rows.some((c) => c.id === activeConn);
         if (known) setActiveId(activeConn);
@@ -184,6 +212,11 @@ export default function App() {
         // keystroke would build tabs a connection switch then discards.
         event.preventDefault();
         newTab();
+      } else if (key === "j" && screen === "workspace") {
+        // Toggle the AI chat panel. Workspace-only: it needs a connection's
+        // schema to be useful.
+        event.preventDefault();
+        setShowChat((open) => !open);
       }
     }
     window.addEventListener("keydown", onKey);
@@ -223,10 +256,19 @@ export default function App() {
     const result = await run(dialect.tablesSql);
     if (result === null) {
       setTables([]);
+      setSchema(new Map());
       return;
     }
     setTables(parseTables(result.out));
-  }, [run, dialect]);
+    // Column metadata for the AI chat, loaded OUTSIDE run() so a slow
+    // information_schema scan never blocks the grid or the busy indicator.
+    // Best-effort: on failure the chat falls back to bare table names.
+    if (active) {
+      void exec(active.url, dialect.columnsSql, dialect.driver).then((columns) => {
+        setSchema(columns.ok ? parseColumns(columns.out) : new Map());
+      });
+    }
+  }, [run, dialect, active]);
 
   /// Best-effort total for the footer, deliberately OUTSIDE `run()`: it never
   /// touches the busy state (the rows are already on screen — a count on a
@@ -757,6 +799,28 @@ export default function App() {
     setSaveName(null);
   }
 
+  /// Open a SQL statement from the chat as its own query tab. The AI drafts;
+  /// the human reviews and runs — nothing the model writes touches the
+  /// database on its own, matching the app's staged-edits philosophy.
+  function sendToEditor(sql: string) {
+    const created: QueryTab = { ...freshTab(nextTabId, "chat"), sql: sql.trim() };
+    setTabs((prev) => [...prev, created]);
+    setActiveTabId(created.id);
+    setNextTabId((n) => n + 1);
+    setSaveName(null);
+  }
+
+  /// Selecting a model or endpoint also persists it, like the active
+  /// connection — a preference that should survive a restart.
+  function updateAiModel(next: string) {
+    setAiModel(next);
+    void storeSaveModel(next);
+  }
+  function updateAiEndpoint(next: string) {
+    setAiEndpoint(next);
+    void storeSaveEndpoint(next);
+  }
+
   const stagedRowCount = new Set(tab.staged.map((e) => e.key)).size;
   const firstRow = tab.pageIndex * tab.pageSize + (tab.page.rows.length > 0 ? 1 : 0);
   const lastRow = tab.pageIndex * tab.pageSize + tab.page.rows.length;
@@ -788,6 +852,7 @@ export default function App() {
         closeTab,
         commit: () => void commitStaged(),
         discard: () => patchTab({ staged: [] }),
+        toggleChat: () => setShowChat((open) => !open),
       }}
     />
   );
@@ -838,6 +903,8 @@ export default function App() {
           onSelect={selectTab}
           onClose={closeTab}
           onNew={newTab}
+          chatOpen={showChat}
+          onToggleChat={() => setShowChat((open) => !open)}
         />
 
         {/* What a tab is decides what it shows: a table you opened is browsed
@@ -1042,6 +1109,23 @@ export default function App() {
           )}
         </footer>
       </main>
+
+      {/* The AI chat is its own workspace column, alongside the grid rather
+          than over it, so results stay in view while you ask about them. */}
+      {showChat && (
+        <ChatPanel
+          endpoint={aiEndpoint}
+          setEndpoint={updateAiEndpoint}
+          model={aiModel}
+          setModel={updateAiModel}
+          tables={tables}
+          schema={schema}
+          dialectName={dialect.driver}
+          connectionName={active ? active.name : ""}
+          onSendToEditor={sendToEditor}
+          onClose={() => setShowChat(false)}
+        />
+      )}
       </div>
     </>
   );

@@ -31,6 +31,34 @@ export interface TableRef {
   name: string;
 }
 
+/// One column of a table, for the AI chat's schema context.
+export interface ColumnRef {
+  name: string;
+  type: string;
+}
+
+/// Columns grouped by their table id (`schema.name`), as `columnsSql`
+/// returns them. Table order and column order are preserved.
+export type SchemaColumns = Map<string, ColumnRef[]>;
+
+/// Parse `(table_schema, table_name, column_name, data_type)` records into a
+/// map keyed by `schema.name`. Skips the header record.
+export function parseColumns(out: string): SchemaColumns {
+  const lines = records(out);
+  const schema: SchemaColumns = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const fields = lines[i].split(US);
+    if (fields.length < 4) continue;
+    const [tableSchema, tableName, column, type] = fields;
+    const id = `${tableSchema}.${tableName}`;
+    const cols = schema.get(id);
+    const ref: ColumnRef = { name: column, type };
+    if (cols) cols.push(ref);
+    else schema.set(id, [ref]);
+  }
+  return schema;
+}
+
 export interface Page {
   cols: string[];
   rows: string[][];

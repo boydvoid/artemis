@@ -17,6 +17,13 @@ export const sqliteDialect: Dialect = {
     "SELECT 'main' AS table_schema, name AS table_name FROM sqlite_master " +
     "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;",
 
+  // Table-valued pragma join: one row per column across every table, so the
+  // chat gets the whole schema in a single round trip like Postgres does.
+  columnsSql:
+    "SELECT 'main' AS table_schema, m.name AS table_name, p.name AS column_name, p.type AS data_type " +
+    "FROM sqlite_master m JOIN pragma_table_info(m.name) p " +
+    "WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, p.cid;",
+
   // `schema` is always the synthetic "main"; pragma_table_info addresses the
   // table by bare name. Emitting `pk:<name>` matches the Postgres shape so
   // the shared parser needs no branch.

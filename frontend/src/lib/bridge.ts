@@ -31,6 +31,9 @@ interface Chunk {
 
 interface ZeroApi {
   invoke<T>(command: string, payload?: unknown): Promise<T>;
+  /// Subscribe to a native-emitted event (the shell's `emit_window_event`).
+  /// Returns an unsubscribe function. Present in the injected bridge script.
+  on?(name: string, callback: (detail: unknown) => void): () => void;
 }
 
 function zero(): ZeroApi | null {
@@ -125,4 +128,30 @@ export async function pickSqliteFile(): Promise<string | null> {
 /// Run SQL against the app's own SQLite store (sqlite3, native side).
 export function storeExec(sql: string): Promise<ExecResult> {
   return invoke("store.exec", { sql });
+}
+
+/// Invoke an arbitrary bridge command and get its typed result. For commands
+/// (like the Ollama ones) that answer with their own shape rather than the
+/// ExecResult envelope. Throws when there is no native shell.
+export function invokeCommand<T>(command: string, payload: unknown): Promise<T> {
+  const api = zero();
+  if (!api) return Promise.reject(new Error(NO_BRIDGE));
+  return api.invoke<T>(command, payload);
+}
+
+/// Subscribe to a native event pushed from the Zig side. Prefers the
+/// injected `window.zero.on`, and falls back to the `native-sdk:<name>`
+/// DOM CustomEvent the same script dispatches. Returns an unsubscribe fn;
+/// a no-op when there is no shell (plain browser dev).
+export function onNativeEvent<T = unknown>(
+  name: string,
+  callback: (detail: T) => void,
+): () => void {
+  const api = zero();
+  if (api && typeof api.on === "function") {
+    return api.on(name, (detail) => callback(detail as T));
+  }
+  const handler = (event: Event) => callback((event as CustomEvent).detail as T);
+  window.addEventListener(`native-sdk:${name}`, handler);
+  return () => window.removeEventListener(`native-sdk:${name}`, handler);
 }
