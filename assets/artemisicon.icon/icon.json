@@ -1,14 +1,21 @@
 {
   "fill" : {
-    "solid" : "display-p3:0.25213,0.24563,0.12531,1.00000"
+    "automatic-gradient" : "display-p3:0.15752,0.09827,0.00129,1.00000"
   },
   "groups" : [
     {
       "layers" : [
         {
-          "glass" : true,
-          "image-name" : "icon.png",
-          "name" : "icon"
+          "fill" : "automatic",
+          "image-name" : "artemis icon.png",
+          "name" : "artemis icon",
+          "position" : {
+            "scale" : 0.5,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
         }
       ],
       "shadow" : {
