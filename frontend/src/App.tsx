@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, RefreshCw, Save, Trash2, X } from "lucide-react";
+import CommandMenu from "@/components/CommandMenu";
 import CommitPanel from "@/components/CommitPanel";
 import Connections from "@/components/Connections";
 import DataGrid from "@/components/DataGrid";
@@ -79,6 +80,8 @@ export default function App() {
   // Whether the staged-edits review panel is open. App-level because it and
   // the row inspector share the grid's right edge — only one shows at a time.
   const [showCommit, setShowCommit] = useState(false);
+  // The ⌘K command palette.
+  const [commandOpen, setCommandOpen] = useState(false);
 
   /// Queries can overlap — opening a restored workspace starts the catalog
   /// load and the active tab's first run together — so busy is a count, not
@@ -165,6 +168,28 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  // ⌘K opens the command palette from anywhere; ⌘T opens a fresh query tab.
+  // Both are captured globally so they work whatever holds focus (the editor,
+  // the grid, a field). ⌘↵ stays with the editor, which owns Run.
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      const key = event.key.toLowerCase();
+      if (key === "k") {
+        event.preventDefault();
+        setCommandOpen((open) => !open);
+      } else if (key === "t" && screen === "workspace") {
+        // A tab only means something in the workspace; on the home screen the
+        // keystroke would build tabs a connection switch then discards.
+        event.preventDefault();
+        newTab();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nextTabId, screen]);
 
   /// Every statement goes through here so timing, busy state and error
   /// reporting happen in exactly one place.
@@ -736,25 +761,61 @@ export default function App() {
   const firstRow = tab.pageIndex * tab.pageSize + (tab.page.rows.length > 0 ? 1 : 0);
   const lastRow = tab.pageIndex * tab.pageSize + tab.page.rows.length;
 
+  // The palette is a lens over actions the rest of the UI already exposes, so
+  // it renders on both screens with the same handlers.
+  const commandMenu = (
+    <CommandMenu
+      open={commandOpen}
+      onOpenChange={setCommandOpen}
+      screen={screen}
+      connections={connections}
+      activeId={activeId}
+      tables={tables}
+      saved={saved}
+      tabs={tabs}
+      activeTabId={activeTabId}
+      hasStaged={tab.staged.length > 0}
+      canRun={!!active && tab.source.kind !== "table" && tab.sql.trim().length > 0}
+      actions={{
+        home: () => setScreen("home"),
+        openConnection,
+        openTable: (t) => void openTable(t),
+        openSaved,
+        selectTab,
+        newQuery: newTab,
+        runQuery: () => void runEditor(),
+        reloadTables: () => void loadTables(),
+        closeTab,
+        commit: () => void commitStaged(),
+        discard: () => patchTab({ staged: [] }),
+      }}
+    />
+  );
+
   if (screen === "home") {
     return (
-      <Connections
-        connections={connections}
-        activeId={activeId}
-        busy={busy}
-        draftName={draftName}
-        draftUrl={draftUrl}
-        setDraftName={setDraftName}
-        setDraftUrl={setDraftUrl}
-        onAdd={() => void addConnection()}
-        onOpen={openConnection}
-        onRemove={(id) => void removeConnection(id)}
-      />
+      <>
+        {commandMenu}
+        <Connections
+          connections={connections}
+          activeId={activeId}
+          busy={busy}
+          draftName={draftName}
+          draftUrl={draftUrl}
+          setDraftName={setDraftName}
+          setDraftUrl={setDraftUrl}
+          onAdd={() => void addConnection()}
+          onOpen={openConnection}
+          onRemove={(id) => void removeConnection(id)}
+        />
+      </>
     );
   }
 
   return (
-    <div className="flex h-full">
+    <>
+      {commandMenu}
+      <div className="flex h-full">
       <Rail
         activeName={active ? active.name : ""}
         onHome={() => setScreen("home")}
@@ -981,7 +1042,8 @@ export default function App() {
           )}
         </footer>
       </main>
-    </div>
+      </div>
+    </>
   );
 }
 
