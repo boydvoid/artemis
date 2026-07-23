@@ -6,7 +6,7 @@
 // happened to be active. Filters belong to the table they narrow, so they now
 // live inside the table tab itself and this strip is documents only.
 
-import { Plus, SlidersHorizontal, X } from "lucide-react";
+import { Bot, Plus, SlidersHorizontal, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { countConditions } from "@/lib/sql";
@@ -18,6 +18,10 @@ interface Props {
   onSelect: (id: number) => void;
   onClose: (id: number) => void;
   onNew: () => void;
+  /// AI chat panel state + toggle, surfaced here as the top-bar action so the
+  /// chat is one click away, not only ⌘J / the command palette.
+  chatOpen: boolean;
+  onToggleChat: () => void;
 }
 
 export default function TabStrip(props: Props) {
@@ -81,6 +85,22 @@ export default function TabStrip(props: Props) {
 
       <Button size="icon-xs" variant="ghost" onClick={props.onNew} aria-label="New query tab">
         <Plus />
+      </Button>
+
+      <span className="flex-1" />
+
+      {/* The AI chat toggle. Amber when open, matching the app's active accent,
+          so its state reads at a glance. */}
+      <Button
+        size="sm"
+        variant={props.chatOpen ? "secondary" : "ghost"}
+        className={cn("mb-1 gap-1.5", props.chatOpen && "text-amber")}
+        onClick={props.onToggleChat}
+        aria-pressed={props.chatOpen}
+        title="AI chat (⌘J)"
+      >
+        <Bot />
+        Chat
       </Button>
     </div>
   );
