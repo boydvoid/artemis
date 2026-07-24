@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/NoBGIcon.png" alt="Artemis logo" width="120" />
+</p>
+
 # Artemis
 
 A desktop database browser — PostgreSQL and SQLite. React in the system

@@ -26,7 +26,10 @@ interface Props {
 
 export default function TabStrip(props: Props) {
   return (
-    <div className="flex flex-none items-center gap-0.5 border-b border-border px-2 pt-1.5">
+    <div className="flex flex-none items-center border-b border-border px-2 pt-1.5">
+      {/* Tabs scroll horizontally within the flexible space so a long list
+          never pushes the pinned AI action off the right edge. */}
+      <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto scrollbar-none">
       {props.tabs.map((tab) => {
         const active = tab.id === props.activeTabId;
         // A filtered tab shows fewer rows than its name implies, and on an
@@ -37,7 +40,7 @@ export default function TabStrip(props: Props) {
           <div
             key={tab.id}
             className={cn(
-              "group flex h-7 cursor-pointer items-center gap-1.5 rounded-t-md border border-b-0 px-2.5 text-[12px]",
+              "group flex h-7 flex-none cursor-pointer items-center gap-1.5 rounded-t-md border border-b-0 px-2.5 text-[12px]",
               active
                 ? "border-border bg-background text-foreground"
                 : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",
@@ -83,18 +86,24 @@ export default function TabStrip(props: Props) {
         );
       })}
 
-      <Button size="icon-xs" variant="ghost" onClick={props.onNew} aria-label="New query tab">
+      <Button
+        size="icon-xs"
+        variant="ghost"
+        className="flex-none"
+        onClick={props.onNew}
+        aria-label="New query tab"
+      >
         <Plus />
       </Button>
+      </div>
 
-      <span className="flex-1" />
-
-      {/* The AI chat toggle. Amber when open, matching the app's active accent,
-          so its state reads at a glance. */}
+      {/* The AI chat toggle stays pinned to the top-right of the strip, never
+          scrolling with the tabs. Amber when open, matching the app's active
+          accent, so its state reads at a glance. */}
       <Button
         size="sm"
         variant={props.chatOpen ? "secondary" : "ghost"}
-        className={cn("mb-1 gap-1.5", props.chatOpen && "text-amber")}
+        className={cn("mb-1 ml-0.5 flex-none gap-1.5", props.chatOpen && "text-amber")}
         onClick={props.onToggleChat}
         aria-pressed={props.chatOpen}
         title="AI chat (⌘J)"

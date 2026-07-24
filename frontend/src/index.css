@@ -326,3 +326,13 @@
     background: var(--amber);
   }
 }
+
+/* Hide the scrollbar on horizontally-scrolling strips (e.g. the tab bar)
+   while keeping the content scrollable via wheel/trackpad. */
+@utility scrollbar-none {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
