@@ -281,8 +281,15 @@ pub fn tags(arena: std.mem.Allocator, io: Io, url: []const u8) Result {
 const ChatLine = struct {
     message: ?struct { content: []const u8 = "" } = null,
     done: bool = false,
+    /// Why the stream ended: "stop" is a natural finish; "length" means the
+    /// context window filled mid-reply and the text is silently truncated —
+    /// which the caller must be able to tell apart from a complete answer.
+    done_reason: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
 };
+
+/// What one NDJSON line means for the stream.
+const LineOutcome = enum { more, done, truncated };
 
 /// POST /api/chat with the caller's JSON body (which must set
 /// `"stream": true`). Every content delta is handed to `sink.emit` as it
@@ -328,8 +335,19 @@ pub fn chat(arena: std.mem.Allocator, io: Io, url: []const u8, body: []const u8,
         while (std.mem.indexOfScalar(u8, pending.items, '\n')) |nl| {
             const line = std.mem.trim(u8, pending.items[0..nl], " \r\t");
             if (line.len > 0) {
-                if (handleLine(line_arena_state.allocator(), line, &full, arena, sink)) |done| {
-                    if (done) return .{ .out = full.items, .code = 0, .err = "" };
+                if (handleLine(line_arena_state.allocator(), line, &full, arena, sink)) |outcome| {
+                    switch (outcome) {
+                        .more => {},
+                        .done => return .{ .out = full.items, .code = 0, .err = "" },
+                        // The window filled mid-reply: the text so far is
+                        // real but incomplete, and only the caller can say
+                        // so to the user.
+                        .truncated => return .{
+                            .out = full.items,
+                            .code = -2,
+                            .err = "the reply hit the model's context window and was cut off",
+                        },
+                    }
                 } else |_| {}
                 _ = line_arena_state.reset(.retain_capacity);
             }
@@ -352,7 +370,7 @@ fn handleLine(
     full: *std.ArrayList(u8),
     full_arena: std.mem.Allocator,
     sink: Sink,
-) !bool {
+) !LineOutcome {
     const parsed = try std.json.parseFromSliceLeaky(ChatLine, line_arena, line, .{ .ignore_unknown_fields = true });
     if (parsed.message) |message| {
         if (message.content.len > 0) {
@@ -360,5 +378,9 @@ fn handleLine(
             try full.appendSlice(full_arena, message.content);
         }
     }
-    return parsed.done;
+    if (!parsed.done) return .more;
+    if (parsed.done_reason) |reason| {
+        if (std.mem.eql(u8, reason, "length")) return .truncated;
+    }
+    return .done;
 }

@@ -1,0 +1,18 @@
+.{
+  .artifact = "macos",
+  .target = "macos",
+  .version = "0.2.0",
+  .app_id = "dev.native_sdk.artemis",
+  .executable = "artemis",
+  .optimize = "ReleaseFast",
+  .web_engine = "system",
+  .web_layer = "system (declared: .frontend)",
+  .signing = "none",
+  .asset_count = 63,
+  .frontend = .{ .dist = "frontend/dist", .entry = "index.html", .spa_fallback = true },
+
+  .capabilities = .{
+    "webview",
+
+  },
+}

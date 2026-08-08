@@ -91,6 +91,28 @@ function newStreamId(): string {
   return uuid ?? `s-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
 }
 
+/// Context window (tokens) requested for a chat, sized to what is actually
+/// being sent. Ollama's default is small (2048 on many models), and the
+/// system prompt carries the whole DB schema — at which point llama.cpp
+/// silently drops the OLDEST tokens (the schema itself) and the model
+/// invents columns; and when the window fills mid-generation the reply just
+/// stops mid-sentence with no error. A fixed 8192 was not enough for large
+/// schemas, so the window scales with the payload: ~3 chars per token is a
+/// conservative estimate for English + SQL, plus headroom for the reply.
+/// The daemon clamps the request down when a model or machine can't go
+/// that high.
+export const CHAT_MIN_CTX = 8192;
+export const CHAT_MAX_CTX = 32768;
+
+export function contextSizeFor(messages: ChatMessage[]): number {
+  const chars = messages.reduce((total, m) => total + m.content.length, 0);
+  const estimated = Math.ceil(chars / 3) + 2048;
+  const clamped = Math.min(Math.max(estimated, CHAT_MIN_CTX), CHAT_MAX_CTX);
+  // Round up to a 1024 boundary so repeated requests reuse the same loaded
+  // model instance instead of reloading it for every small history change.
+  return Math.ceil(clamped / 1024) * 1024;
+}
+
 export interface ChatOptions {
   endpoint: string;
   model: string;
@@ -116,6 +138,7 @@ export function chat(options: ChatOptions): ChatHandle {
     model: options.model,
     messages: options.messages,
     stream: true,
+    options: { num_ctx: contextSizeFor(options.messages) },
   });
 
   const unsubscribe = onNativeEvent<{ id: string; delta: string }>("ollama.token", (detail) => {
