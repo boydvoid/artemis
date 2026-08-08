@@ -188,9 +188,6 @@ export default function Connections(props: Props) {
                             </span>
                           )}
                         </div>
-                        <div className="mt-1.5 overflow-hidden font-mono text-[11px] whitespace-nowrap text-faint [mask-image:linear-gradient(90deg,#000_calc(100%-40px),transparent)]">
-                          {c.url}
-                        </div>
                       </div>
 
                       <div className="flex flex-none items-center pr-2">
@@ -402,10 +399,16 @@ export default function Connections(props: Props) {
           </div>
         </Panel>
 
-        <p className="mt-5 flex items-center gap-1.5 font-mono text-[10px] tracking-[0.06em] text-faint">
+        <div className="mt-5 flex items-center gap-1.5 font-mono text-[10px] tracking-[0.06em] text-faint">
           <span className="text-muted-foreground">·</span>
-          Stored locally in SQLite, in plain text.
-        </p>
+          <span>Stored locally in SQLite, in plain text.</span>
+          <span className="flex-1" />
+          {/* Which build you're on. Sourced from app.zon at compile time, so it
+              always matches the packaged binary — no second copy to drift. */}
+          <span className="tracking-[0.12em] uppercase" title="Artemis version">
+            v{__APP_VERSION__}
+          </span>
+        </div>
       </div>
     </div>
   );

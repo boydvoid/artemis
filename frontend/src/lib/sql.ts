@@ -268,21 +268,105 @@ export function countSql(
 /// The row count of a free-form SELECT — the same subquery pagination
 /// walks, so a statement with its own LIMIT counts what it can page over.
 export function wrapCount(base: string): string {
-  const trimmed = base.trim().replace(/;\s*$/, "");
-  return `SELECT count(*) FROM (${trimmed}) AS artemis_count;`;
+  return `SELECT count(*) FROM (${subquery(base)}) AS artemis_count;`;
 }
 
 /// A free-form SELECT wrapped for pagination (probe row included).
 export function wrapPaged(base: string, offset: number, pageSize: number): string {
-  const trimmed = base.trim().replace(/;\s*$/, "");
-  return `SELECT * FROM (${trimmed}) AS artemis_page LIMIT ${pageSize + 1} OFFSET ${offset};`;
+  return `SELECT * FROM (${subquery(base)}) AS artemis_page LIMIT ${pageSize + 1} OFFSET ${offset};`;
+}
+
+/// A statement as the body of a subquery. The newline is load-bearing: a
+/// statement ending in `-- note` would otherwise swallow the closing paren.
+function subquery(base: string): string {
+  return `${base.trim().replace(/;\s*$/, "")}\n`;
 }
 
 /// Whether a statement can be paginated by wrapping it in a subquery.
 /// Anything that is not a bare SELECT/WITH runs verbatim, once.
 export function isPageable(sql: string): boolean {
-  const head = sql.trim().replace(/^\(+/, "").slice(0, 6).toLowerCase();
+  // A leading comment is part of the statement — queries get written with a
+  // note above them — but it says nothing about what the statement does.
+  const head = sql
+    .replace(/^(\s|--[^\n]*|\/\*[\s\S]*?\*\/)+/, "")
+    .replace(/^\(+/, "")
+    .slice(0, 6)
+    .toLowerCase();
   return head.startsWith("select") || head.startsWith("with");
+}
+
+/// Split a script into its statements.
+///
+/// The editor holds a document, not a statement: a scratch pad usually ends up
+/// with several queries in it, separated by semicolons. Splitting them here
+/// means each one is sent on its own, which is what lets the last one be
+/// wrapped for pagination and what keeps a failure attributable to a
+/// statement rather than to the whole box.
+///
+/// The scan is a real one rather than `sql.split(";")` because a semicolon is
+/// only a separator outside quotes and comments — `WHERE note = 'a;b'` is one
+/// statement, and so is a `$$ ... ; ... $$` function body. Blank fragments and
+/// fragments that are nothing but comments are dropped: a trailing `-- todo`
+/// is not a statement to run.
+///
+/// Returned text is trimmed and carries no trailing semicolon, matching what
+/// the wrappers in this file expect.
+export function splitStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let start = 0;
+  let code = false; // has this fragment any runnable text yet?
+  let i = 0;
+
+  function push(end: number) {
+    if (code) statements.push(sql.slice(start, end).trim());
+    code = false;
+  }
+
+  while (i < sql.length) {
+    const ch = sql[i];
+
+    if (ch === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      i = nl < 0 ? sql.length : nl + 1;
+    } else if (ch === "/" && sql[i + 1] === "*") {
+      const close = sql.indexOf("*/", i + 2);
+      i = close < 0 ? sql.length : close + 2;
+    } else if (ch === "'" || ch === '"') {
+      // Postgres' E'' strings are the one place a backslash escapes the
+      // closing quote; everywhere else the escape is a doubled quote, and
+      // the doubled case needs no special handling — the closer we find just
+      // reopens the string on the next pass.
+      const escapes = ch === "'" && /(^|[^\w$])[eE]$/.test(sql.slice(start, i));
+      i += 1;
+      while (i < sql.length) {
+        if (escapes && sql[i] === "\\") i += 2;
+        else if (sql[i] === ch) { i += 1; break; }
+        else i += 1;
+      }
+      code = true;
+    } else if (ch === "$") {
+      // A dollar quote's tag runs to the next `$`, and only a tag made of
+      // identifier characters is one — `$1` and a bare `$` are not.
+      const tag = /^\$[A-Za-z_][A-Za-z_0-9]*\$|^\$\$/.exec(sql.slice(i));
+      if (tag) {
+        const close = sql.indexOf(tag[0], i + tag[0].length);
+        i = close < 0 ? sql.length : close + tag[0].length;
+      } else {
+        i += 1;
+      }
+      code = true;
+    } else if (ch === ";") {
+      push(i);
+      i += 1;
+      start = i;
+    } else {
+      if (!/\s/.test(ch)) code = true;
+      i += 1;
+    }
+  }
+  push(sql.length);
+
+  return statements;
 }
 
 export interface StagedEdit {

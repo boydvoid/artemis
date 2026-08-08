@@ -37,9 +37,13 @@ import {
   editText,
   parseColumns,
   parseCount,
+  parseForeignKeys,
   parsePage,
   parsePkCols,
   parseTables,
+  parseValueCatalog,
+  type ColumnValues,
+  type ForeignKeyRef,
   type SchemaColumns,
   type TableRef,
 } from "@/lib/parse";
@@ -61,6 +65,7 @@ import {
   isPageable,
   plainSql,
   rowPredicate,
+  splitStatements,
   wrapCount,
   wrapPaged,
   type Sort,
@@ -74,6 +79,29 @@ const DEFAULT_EDITOR_HEIGHT = 180;
 const MIN_EDITOR_HEIGHT = 56;
 const MIN_GRID_HEIGHT = 140;
 
+/// Columns whose values must never end up in an AI prompt, by name. The
+/// cardinality check would drop most of these anyway; this is the belt to
+/// that suspender.
+const SENSITIVE_COLUMN = /password|secret|token|hash|email|phone|api_?key/i;
+
+/// The text columns worth sampling for the AI chat's value catalog. Bounded
+/// so a very wide schema cannot produce an unbounded catalog query.
+function catalogTargets(
+  tables: TableRef[],
+  schema: SchemaColumns,
+  isCatalogType: (type: string) => boolean,
+): Array<{ schema: string; table: string; column: string }> {
+  const targets: Array<{ schema: string; table: string; column: string }> = [];
+  for (const t of tables) {
+    for (const c of schema.get(t.id) ?? []) {
+      if (!isCatalogType(c.type) || SENSITIVE_COLUMN.test(c.name)) continue;
+      targets.push({ schema: t.schema, table: t.name, column: c.name });
+      if (targets.length >= 300) return targets;
+    }
+  }
+  return targets;
+}
+
 export default function App() {
   // Connections are the home screen; picking one opens the workspace.
   const [screen, setScreen] = useState<"home" | "workspace">("home");
@@ -86,6 +114,8 @@ export default function App() {
   // Columns per table (`schema.name` → columns), loaded best-effort for the
   // AI chat's schema context so it never invents column names.
   const [schema, setSchema] = useState<SchemaColumns>(new Map());
+  const [foreignKeys, setForeignKeys] = useState<ForeignKeyRef[]>([]);
+  const [valueCatalog, setValueCatalog] = useState<ColumnValues[]>([]);
   const [tableFilter, setTableFilter] = useState("");
   const [saved, setSaved] = useState<SavedQuery[]>([]);
 
@@ -257,15 +287,32 @@ export default function App() {
     if (result === null) {
       setTables([]);
       setSchema(new Map());
+      setForeignKeys([]);
+      setValueCatalog([]);
       return;
     }
-    setTables(parseTables(result.out));
-    // Column metadata for the AI chat, loaded OUTSIDE run() so a slow
-    // information_schema scan never blocks the grid or the busy indicator.
-    // Best-effort: on failure the chat falls back to bare table names.
+    const tableRefs = parseTables(result.out);
+    setTables(tableRefs);
+    // Column, foreign-key and value metadata for the AI chat, loaded OUTSIDE
+    // run() so a slow catalog scan never blocks the grid or the busy
+    // indicator. Best-effort: on failure the chat falls back to less context.
     if (active) {
       void exec(active.url, dialect.columnsSql, dialect.driver).then((columns) => {
-        setSchema(columns.ok ? parseColumns(columns.out) : new Map());
+        const parsed = columns.ok ? parseColumns(columns.out) : new Map<string, never[]>();
+        setSchema(parsed);
+        // The value catalog needs the columns to know what to sample, so it
+        // chains off the schema load rather than racing it.
+        const targets = catalogTargets(tableRefs, parsed, dialect.isCatalogType);
+        if (targets.length === 0) {
+          setValueCatalog([]);
+          return;
+        }
+        void exec(active.url, dialect.valueCatalogSql(targets), dialect.driver).then((values) => {
+          setValueCatalog(values.ok ? parseValueCatalog(values.out) : []);
+        });
+      });
+      void exec(active.url, dialect.foreignKeysSql, dialect.driver).then((fks) => {
+        setForeignKeys(fks.ok ? parseForeignKeys(fks.out) : []);
       });
     }
   }, [run, dialect, active]);
@@ -532,14 +579,33 @@ export default function App() {
     void applyQuery({ ...tab.source.query, sort: next }, true);
   }
 
-  async function runEditor() {
-    const statement = tab.sql.trim();
-    if (statement.length === 0) return;
-    const pageable = isPageable(statement);
-    const result = await run(pageable ? wrapPaged(statement, 0, tab.pageSize) : statement);
+  /// Run what the editor is pointing at: the highlighted selection when there
+  /// is one, the whole box otherwise. `sql` comes from the editor itself
+  /// because only it knows the selection; callers with no editor in front of
+  /// them (the command palette) pass nothing and get the whole tab.
+  ///
+  /// A box can hold several statements. They run in order, one send each, and
+  /// the LAST one is the one whose rows land in the grid — the earlier ones
+  /// are the setup you wrote above it. That is also the only one paginated:
+  /// paging re-runs its statement, which would be wrong for anything with an
+  /// effect. A failure anywhere stops the run, leaving the grid untouched and
+  /// psql's message in the error bar.
+  async function runEditor(sql = tab.sql) {
+    const statements = splitStatements(sql);
+    if (statements.length === 0) return;
+
+    for (const statement of statements.slice(0, -1)) {
+      if ((await run(statement)) === null) return;
+    }
+
+    const last = statements[statements.length - 1];
+    const pageable = isPageable(last);
+    const result = await run(pageable ? wrapPaged(last, 0, tab.pageSize) : last);
     if (result === null) return;
+
+    const scope = sql === tab.sql ? "query" : "selection";
     patchTab({
-      source: pageable ? { kind: "sql", sql: statement } : { kind: "none" },
+      source: pageable ? { kind: "sql", sql: last } : { kind: "none" },
       page: parsePage(result.out, false, tab.pageSize),
       pageIndex: 0,
       loaded: true,
@@ -547,10 +613,12 @@ export default function App() {
       // A single-run statement has no result set to count.
       total: null,
       countKey: "",
-      status: pageable ? "query" : "query (single run)",
+      status:
+        (statements.length > 1 ? `${scope} · ${statements.length} statements` : scope) +
+        (pageable ? "" : " (single run)"),
       elapsed: result.ms,
     });
-    if (pageable) refreshCount(tab.id, wrapCount(statement));
+    if (pageable) refreshCount(tab.id, wrapCount(last));
   }
 
   /// Move to a page, optionally resizing it. Changing the size goes through
@@ -809,6 +877,19 @@ export default function App() {
     setNextTabId((n) => n + 1);
     setSaveName(null);
   }
+
+  /// Run one of the chat's exploration probes against the live connection.
+  /// The panel has already sanitized and LIMIT-wrapped the statement; this
+  /// only supplies the connection. Raw framed output goes back — the panel
+  /// owns formatting it for the model.
+  const runChatProbe = useCallback(
+    async (sql: string): Promise<{ ok: boolean; out: string; err: string }> => {
+      if (!active) return { ok: false, out: "", err: "no active connection" };
+      const result = await exec(active.url, sql, dialect.driver);
+      return { ok: result.ok, out: result.out, err: result.err };
+    },
+    [active, dialect],
+  );
 
   /// Selecting a model or endpoint also persists it, like the active
   /// connection — a preference that should survive a restart.
@@ -1120,6 +1201,9 @@ export default function App() {
           setModel={updateAiModel}
           tables={tables}
           schema={schema}
+          foreignKeys={foreignKeys}
+          valueCatalog={valueCatalog}
+          runProbe={runChatProbe}
           dialectName={dialect.driver}
           connectionName={active ? active.name : ""}
           onSendToEditor={sendToEditor}
@@ -1252,7 +1336,7 @@ function Rail(props: RailProps) {
 function Editor(props: {
   sql: string;
   setSql: (v: string) => void;
-  onRun: () => void;
+  onRun: (sql: string) => void;
   busy: boolean;
   disabled: boolean;
   saveName: string | null;
@@ -1265,6 +1349,11 @@ function Editor(props: {
 }) {
   const sectionRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{ startY: number; startHeight: number } | null>(null);
+
+  // The editor owns the decision of what runs; the button just pulls its
+  // trigger. All the pane keeps is whether to say so.
+  const runRef = useRef<(() => void) | null>(null);
+  const [hasSelection, setHasSelection] = useState(false);
 
   // Same shape as the grid's column resize: the drag lives on window so the
   // pointer can leave the 7px handle without dropping it.
@@ -1317,10 +1406,20 @@ function Editor(props: {
           value={props.sql}
           onChange={props.setSql}
           onRun={props.onRun}
+          onSelectionChange={setHasSelection}
+          runRef={runRef}
         />
         <div className="flex flex-col items-center gap-1.5">
-          <Button onClick={props.onRun} disabled={props.busy || props.disabled}>
-            {props.busy ? "running" : "Run"}
+          {/* The label is the only warning that ⌘↵ is about to run part of
+              the box rather than all of it, so it swaps with the selection.
+              Width is pinned so the column does not twitch as you drag. */}
+          <Button
+            className="w-[88px]"
+            onClick={() => runRef.current?.()}
+            disabled={props.busy || props.disabled}
+            title={hasSelection ? "Run the highlighted SQL" : "Run the whole editor"}
+          >
+            {props.busy ? "running" : hasSelection ? "Selection" : "Run"}
           </Button>
           <kbd className="font-mono text-[10px] text-faint">⌘↵</kbd>
           <Button

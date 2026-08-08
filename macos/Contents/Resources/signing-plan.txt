@@ -1,0 +1,2 @@
+signing=none
+unsigned local package

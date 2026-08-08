@@ -8,8 +8,17 @@ import { cn } from "@/lib/utils";
 
 export default function SqlEditor(props: {
   value: string;
+  /// The text to run: the selection when there is one, the whole box
+  /// otherwise. The caller never has to ask which.
+  onRun: (sql: string) => void;
   onChange: (v: string) => void;
-  onRun: () => void;
+  /// Fires when the selection turns into text or back into a bare caret, so
+  /// the Run button outside can say which of the two it will run.
+  onSelectionChange?: (selected: boolean) => void;
+  /// Filled with the editor's own run trigger. A button outside the editor
+  /// cannot see the selection; going through here means ⌘↵ and the button
+  /// run exactly the same thing.
+  runRef?: React.RefObject<(() => void) | null>;
   className?: string;
   style?: React.CSSProperties;
 }) {
@@ -20,8 +29,10 @@ export default function SqlEditor(props: {
   // them through refs so the mount effect never needs them as deps.
   const onRunRef = useRef(props.onRun);
   const onChangeRef = useRef(props.onChange);
+  const onSelectionChangeRef = useRef(props.onSelectionChange);
   onRunRef.current = props.onRun;
   onChangeRef.current = props.onChange;
+  onSelectionChangeRef.current = props.onSelectionChange;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -56,12 +67,36 @@ export default function SqlEditor(props: {
     const upcase = installKeywordUpcase(editor);
     editor.onDidChangeModelContent(() => onChangeRef.current(editor.getValue()));
 
+    // Highlight some SQL and that is what runs — the rest of the box is
+    // scratch. Whitespace-only selections don't count: dragging past the end
+    // of a statement should still run the box, not nothing.
+    function selectedSql(): string {
+      const selection = editor.getSelection();
+      const model = editor.getModel();
+      if (!selection || !model || selection.isEmpty()) return "";
+      const text = model.getValueInRange(selection);
+      return text.trim().length > 0 ? text : "";
+    }
+    function runNow() {
+      onRunRef.current(selectedSql() || editor.getValue());
+    }
+
     // Cmd/Ctrl+Enter runs, matching every other SQL console.
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () =>
-      onRunRef.current(),
-    );
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, runNow);
+    if (props.runRef) props.runRef.current = runNow;
+
+    let selected = false;
+    const selectionWatch = editor.onDidChangeCursorSelection(() => {
+      const next = selectedSql().length > 0;
+      if (next === selected) return; // fires per keystroke; the flag rarely moves
+      selected = next;
+      onSelectionChangeRef.current?.(next);
+    });
 
     return () => {
+      if (props.runRef) props.runRef.current = null;
+      onSelectionChangeRef.current?.(false);
+      selectionWatch.dispose();
       upcase.dispose();
       editor.getModel()?.dispose();
       editor.dispose();

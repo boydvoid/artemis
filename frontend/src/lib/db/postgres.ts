@@ -19,6 +19,49 @@ export const postgresDialect: Dialect = {
     "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') " +
     "ORDER BY table_schema, table_name, ordinal_position;",
 
+  // pg_constraint rather than information_schema: one pass, no privilege
+  // filtering surprises, and multi-column keys come out in order via the
+  // paired unnest.
+  foreignKeysSql:
+    "SELECT sn.nspname, st.relname, sa.attname, tn.nspname, tt.relname, ta.attname " +
+    "FROM pg_constraint c " +
+    "JOIN pg_class st ON st.oid = c.conrelid " +
+    "JOIN pg_namespace sn ON sn.oid = st.relnamespace " +
+    "JOIN pg_class tt ON tt.oid = c.confrelid " +
+    "JOIN pg_namespace tn ON tn.oid = tt.relnamespace " +
+    "JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord) ON true " +
+    "JOIN pg_attribute sa ON sa.attrelid = c.conrelid AND sa.attnum = k.attnum " +
+    "JOIN pg_attribute ta ON ta.attrelid = c.confrelid AND ta.attnum = k.fattnum " +
+    "WHERE c.contype = 'f' AND sn.nspname NOT IN ('pg_catalog', 'information_schema') " +
+    "ORDER BY sn.nspname, st.relname, c.conname, k.ord;",
+
+  // text-ish columns plus USER-DEFINED, which is how information_schema
+  // reports enums — the strongest catalog candidates of all.
+  isCatalogType(type) {
+    return (
+      type === "text" ||
+      type === "character varying" ||
+      type === "character" ||
+      type === "USER-DEFINED"
+    );
+  },
+
+  // Per column: distinct over a 1000-row sample, capped at 26 values. The
+  // sample bounds the work on huge tables; `::text` renders enums.
+  valueCatalogSql(targets) {
+    const parts = targets.map(({ schema, table, column }) => {
+      const tableId = literal(`${schema}.${table}`);
+      const col = ident(column);
+      return (
+        `SELECT ${tableId}, ${literal(column)}, v::text FROM ` +
+        `(SELECT DISTINCT ${col} AS v FROM ` +
+        `(SELECT ${col} FROM ${ident(schema)}.${ident(table)} WHERE ${col} IS NOT NULL LIMIT 1000) s0 ` +
+        `LIMIT 26) s1`
+      );
+    });
+    return parts.join("\nUNION ALL\n") + ";";
+  },
+
   pkSql(schema, name) {
     const qualified = `${ident(schema)}.${ident(name)}`;
     return (

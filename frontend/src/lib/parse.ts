@@ -59,6 +59,80 @@ export function parseColumns(out: string): SchemaColumns {
   return schema;
 }
 
+/// One foreign key column pair, for the AI chat's join paths. Table ids use
+/// the same `schema.name` shape as `SchemaColumns` keys.
+export interface ForeignKeyRef {
+  tableId: string;
+  column: string;
+  refTableId: string;
+  /// Empty when the FK references the target's primary key implicitly
+  /// (SQLite allows omitting the column list).
+  refColumn: string;
+}
+
+/// Parse `(table_schema, table_name, column_name, foreign_schema,
+/// foreign_name, foreign_column)` records. Skips the header record.
+export function parseForeignKeys(out: string): ForeignKeyRef[] {
+  const lines = records(out);
+  const fks: ForeignKeyRef[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const fields = lines[i].split(US);
+    if (fields.length < 6) continue;
+    const [schema, table, column, refSchema, refTable, refColumn] = fields;
+    if (!table || !column || !refTable) continue;
+    fks.push({
+      tableId: `${schema}.${table}`,
+      column,
+      refTableId: `${refSchema}.${refTable}`,
+      refColumn: isNullField(refColumn) ? "" : refColumn,
+    });
+  }
+  return fks;
+}
+
+/// The complete value list of one small text column, for the AI chat. Only
+/// columns whose (sampled) values are few and short qualify — these are the
+/// enum-like columns ("status", "name", "plan") whose actual values decide
+/// which table a request like "the flowiki org" is really about.
+export interface ColumnValues {
+  tableId: string;
+  column: string;
+  values: string[];
+}
+
+/// How many distinct values still count as "enum-like". The catalog query
+/// fetches one more than this so an over-full column can be told apart from
+/// one with exactly the cap.
+export const VALUE_CATALOG_CAP = 25;
+
+/// Parse `(table_id, column_name, value)` records into per-column value
+/// lists, dropping any column that proves to be free text after all: more
+/// distinct values than the cap, or values too long to be labels.
+export function parseValueCatalog(out: string): ColumnValues[] {
+  const lines = records(out);
+  const groups = new Map<string, ColumnValues>();
+  for (let i = 1; i < lines.length; i++) {
+    const fields = lines[i].split(US);
+    if (fields.length < 3) continue;
+    const [tableId, column, value] = fields;
+    if (isNullField(value)) continue;
+    const key = `${tableId}\x1f${column}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { tableId, column, values: [] };
+      groups.set(key, group);
+    }
+    group.values.push(value);
+  }
+  const catalog: ColumnValues[] = [];
+  for (const group of groups.values()) {
+    if (group.values.length === 0 || group.values.length > VALUE_CATALOG_CAP) continue;
+    if (group.values.some((v) => v.length > 80)) continue;
+    catalog.push(group);
+  }
+  return catalog;
+}
+
 export interface Page {
   cols: string[];
   rows: string[][];

@@ -40,6 +40,20 @@ export interface Dialect {
   /// then ordinal order. Feeds the AI chat's schema context so it never
   /// invents column names.
   columnsSql: string;
+  /// Lists every foreign key as `(table_schema, table_name, column_name,
+  /// foreign_schema, foreign_name, foreign_column)` records. Feeds the AI
+  /// chat's join paths so it joins along real relationships instead of
+  /// guessing column names like `user_id` that may not exist.
+  foreignKeysSql: string;
+  /// Whether a column of this type could be an enum-like label column worth
+  /// listing in the AI chat's value catalog. Type only — cardinality is
+  /// checked by the catalog query itself.
+  isCatalogType(type: string): boolean;
+  /// One query that samples the distinct values of every candidate column:
+  /// `(table_id, column_name, value)` records, at most `VALUE_CATALOG_CAP + 1`
+  /// values per column (the extra one marks "too many"), each drawn from a
+  /// bounded sample so a huge table costs nothing.
+  valueCatalogSql(targets: Array<{ schema: string; table: string; column: string }>): string;
   /// Primary-key columns of one table, each emitted as a `pk:<name>` record
   /// so the shared parser reads them the same way for every engine.
   pkSql(schema: string, name: string): string;

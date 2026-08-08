@@ -128,6 +128,14 @@ pub fn build(b: *std.Build) void {
     const frontend_step = b.step("frontend-build", "Build the frontend");
     frontend_step.dependOn(&frontend_build.step);
 
+    // The default build (`zig build`, i.e. `native build`) regenerates
+    // frontend/dist too. Without this, `native build` compiled a fresh exe
+    // against a STALE dist — a frontend edit silently never shipped, and
+    // `native package --binary` then bundled the old assets. `run`/`package`
+    // already chain frontend_build; the bare install step must as well so the
+    // one command people reach for can't produce a half-updated app.
+    b.getInstallStep().dependOn(&frontend_build.step);
+
     const run = b.addRunArtifact(exe);
     run.step.dependOn(&frontend_build.step);
     addCefRuntimeRunFiles(b, target, run, exe, web_engine, cef_dir);
@@ -181,7 +189,7 @@ pub fn build(b: *std.Build) void {
         "--optimize",
         package_optimize_name,
         "--output",
-        b.fmt("zig-out/package/{s}-0.1.0-{s}-{s}{s}", .{ app_exe_name, @tagName(package_target), package_optimize_name, packageSuffix(package_target) }),
+        b.fmt("zig-out/package/{s}-{s}-{s}-{s}{s}", .{ app_exe_name, app_config.version, @tagName(package_target), package_optimize_name, packageSuffix(package_target) }),
         "--binary",
     });
     // The CLI resolves SDK-owned package inputs (the vendored WebView2
@@ -556,6 +564,9 @@ const AppManifestBuildConfig = struct {
     cef_dir: []const u8 = "third_party/cef/macos",
     cef_auto_install: bool = false,
     webview_layer: WebLayerOption = .auto,
+    /// App version from app.zon, used to name the package artifact so the
+    /// filename tracks the single source of truth instead of a hardcode.
+    version: []const u8 = "0.0.0",
     /// The first web declaration found (for teaching messages), or
     /// null when app.zon declares no web use. `web_engine = "system"`
     /// alone is NOT web intent — it is the default in many canvas
@@ -568,6 +579,7 @@ const AppManifestBuildConfig = struct {
 /// ignored. Full schema validation stays with `native validate`.
 const InferenceManifest = struct {
     capabilities: []const []const u8 = &.{},
+    version: []const u8 = "0.0.0",
     web_engine: []const u8 = "system",
     webview_layer: []const u8 = "auto",
     cef: struct {
@@ -606,6 +618,7 @@ fn appManifestBuildConfig(b: *std.Build) AppManifestBuildConfig {
         .cef_dir = raw.cef.dir,
         .cef_auto_install = raw.cef.auto_install,
         .webview_layer = parseWebLayer(raw.webview_layer) orelse @panic("app.zon .webview_layer must be \"auto\", \"include\", or \"exclude\""),
+        .version = raw.version,
     };
     config.web_declaration = blk: {
         if (raw.frontend != null) break :blk "a .frontend block";
