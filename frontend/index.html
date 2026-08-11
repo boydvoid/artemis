@@ -4,6 +4,25 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Artemis</title>
+    <!-- Resolve the theme before the first paint. The module bundle loads too
+         late to do this: setting the class from React would flash the wrong
+         palette on every launch. Mirrors src/lib/theme.ts. -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem("artemis:theme");
+          var theme =
+            saved === "dark" || saved === "light"
+              ? saved
+              : window.matchMedia("(prefers-color-scheme: light)").matches
+                ? "light"
+                : "dark";
+          document.documentElement.classList.toggle("dark", theme === "dark");
+        } catch (e) {
+          /* storage unavailable: the class already on <html> stands */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

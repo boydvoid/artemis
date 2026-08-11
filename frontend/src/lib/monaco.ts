@@ -35,39 +35,78 @@ self.MonacoEnvironment = {
 };
 
 /* Theme colours are the CSS custom properties from index.css, hardcoded because
- * Monaco's theme API takes literal hex and cannot read var(). If you retune the
- * palette there, retune it here too. */
+ * Monaco's theme API takes literal hex and cannot read var(). There are two of
+ * them for the same reason there are two palettes; if you retune either one
+ * there, retune it here too. `--popover` is the editor's ground: the box is a
+ * well sunk into the panel around it, not the canvas.
+ *
+ * lib/theme.ts decides which is active — it calls setTheme in the same breath
+ * as it sets the class on <html>. */
 monaco.editor.defineTheme("artemis", {
   base: "vs-dark",
   inherit: true,
   rules: [
-    { token: "", foreground: "dfe3e6" },
-    { token: "keyword", foreground: "ffb000" }, // amber = the SQL verbs
-    { token: "operator", foreground: "7d868c" },
-    { token: "delimiter", foreground: "7d868c" },
+    { token: "", foreground: "e7ebee" },
+    { token: "keyword", foreground: "ffb020" }, // amber = the SQL verbs
+    { token: "operator", foreground: "98a1a8" },
+    { token: "delimiter", foreground: "98a1a8" },
     { token: "string", foreground: "9ec7a0" },
     { token: "number", foreground: "9ec7a0" },
-    { token: "comment", foreground: "4c5459", fontStyle: "italic" },
+    { token: "comment", foreground: "69727a", fontStyle: "italic" },
     { token: "predefined", foreground: "8fb4d4" },
     { token: "identifier.quote", foreground: "8fb4d4" },
   ],
   colors: {
-    "editor.background": "#0b0c0d",
-    "editor.foreground": "#dfe3e6",
-    "editor.placeholder.foreground": "#4c5459", // --faint
-    "editorLineNumber.foreground": "#2f3436",
-    "editorLineNumber.activeForeground": "#7d868c",
-    "editorCursor.foreground": "#ffb000",
-    "editor.selectionBackground": "#232729",
-    "editor.lineHighlightBackground": "#101214",
-    "editorWidget.background": "#16191c",
-    "editorWidget.border": "#232729",
-    "editorSuggestWidget.background": "#16191c",
-    "editorSuggestWidget.border": "#232729",
-    "editorSuggestWidget.selectedBackground": "#232729",
-    "editorSuggestWidget.highlightForeground": "#ffb000",
-    "scrollbarSlider.background": "#23272980",
-    "scrollbarSlider.hoverBackground": "#232729",
+    "editor.background": "#191c1f",
+    "editor.foreground": "#e7ebee",
+    "editor.placeholder.foreground": "#69727a", // --faint
+    "editorLineNumber.foreground": "#3a4045",
+    "editorLineNumber.activeForeground": "#98a1a8",
+    "editorCursor.foreground": "#ffb020",
+    "editor.selectionBackground": "#2b3137",
+    "editor.lineHighlightBackground": "#1e2327",
+    "editorWidget.background": "#191c1f",
+    "editorWidget.border": "#24292e",
+    "editorSuggestWidget.background": "#191c1f",
+    "editorSuggestWidget.border": "#24292e",
+    "editorSuggestWidget.selectedBackground": "#24292e",
+    "editorSuggestWidget.highlightForeground": "#ffb020",
+    "scrollbarSlider.background": "#24292e80",
+    "scrollbarSlider.hoverBackground": "#24292e",
+  },
+});
+
+monaco.editor.defineTheme("artemis-light", {
+  base: "vs",
+  inherit: true,
+  rules: [
+    { token: "", foreground: "15181b" },
+    { token: "keyword", foreground: "b06105" },
+    { token: "operator", foreground: "59636b" },
+    { token: "delimiter", foreground: "59636b" },
+    { token: "string", foreground: "1f7a46" },
+    { token: "number", foreground: "1f7a46" },
+    { token: "comment", foreground: "8a9299", fontStyle: "italic" },
+    { token: "predefined", foreground: "2c5fd0" },
+    { token: "identifier.quote", foreground: "2c5fd0" },
+  ],
+  colors: {
+    "editor.background": "#f6f7f9",
+    "editor.foreground": "#15181b",
+    "editor.placeholder.foreground": "#8a9299",
+    "editorLineNumber.foreground": "#c2c9d0",
+    "editorLineNumber.activeForeground": "#59636b",
+    "editorCursor.foreground": "#b06105",
+    "editor.selectionBackground": "#dfe4ea",
+    "editor.lineHighlightBackground": "#edf0f3",
+    "editorWidget.background": "#ffffff",
+    "editorWidget.border": "#e3e6ea",
+    "editorSuggestWidget.background": "#ffffff",
+    "editorSuggestWidget.border": "#e3e6ea",
+    "editorSuggestWidget.selectedBackground": "#edf0f3",
+    "editorSuggestWidget.highlightForeground": "#b06105",
+    "scrollbarSlider.background": "#c9d0d780",
+    "scrollbarSlider.hoverBackground": "#c9d0d7",
   },
 });
 

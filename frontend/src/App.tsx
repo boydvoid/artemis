@@ -1,15 +1,36 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, RefreshCw, Save, Trash2, X } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  ChevronsUpDown,
+  RefreshCw,
+  Save,
+  Search,
+  Settings2,
+  Trash2,
+  X,
+} from "lucide-react";
 import ChatPanel from "@/components/ChatPanel";
 import CommandMenu from "@/components/CommandMenu";
 import CommitPanel from "@/components/CommitPanel";
 import Connections from "@/components/Connections";
 import DataGrid from "@/components/DataGrid";
+import Logo from "@/components/Logo";
 import QueryBuilder from "@/components/QueryBuilder";
 import SqlEditor from "@/components/SqlEditor";
 import TabStrip from "@/components/TabStrip";
+import ThemeToggle from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Menu,
+  MenuContent,
+  MenuGroup,
+  MenuItem,
+  MenuLabel,
+  MenuSeparator,
+  MenuTrigger,
+} from "@/components/ui/menu";
 import {
   Select,
   SelectContent,
@@ -55,6 +76,7 @@ import {
 } from "@/lib/aiStore";
 import { DEFAULT_ENDPOINT } from "@/lib/ollama";
 import { clearSession, hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
+import { applyTheme, loadTheme, saveTheme, type Theme } from "@/lib/theme";
 import {
   DEFAULT_PAGE_SIZE,
   PAGE_SIZES,
@@ -131,6 +153,23 @@ export default function App() {
   const [showCommit, setShowCommit] = useState(false);
   // The ⌘K command palette.
   const [commandOpen, setCommandOpen] = useState(false);
+
+  // Light or dark. index.html has already put the right class on <html> by the
+  // time we get here; this is the same value, held in React so the toggle can
+  // render its state, and re-applied on change.
+  const [theme, setThemeState] = useState<Theme>(loadTheme);
+  const setTheme = useCallback((next: Theme) => {
+    setThemeState(next);
+    saveTheme(next);
+    applyTheme(next);
+  }, []);
+  // Monaco's theme is global and set imperatively, so it has to be told once at
+  // mount too — the pre-paint script only knows how to set a CSS class.
+  useEffect(() => {
+    applyTheme(theme);
+    // Mount-only: every later change goes through setTheme, which applies it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // The AI chat panel and its Ollama settings. Endpoint and model persist in
   // the store like any other preference; the panel owns the conversation.
@@ -953,6 +992,8 @@ export default function App() {
           onAdd={() => void addConnection()}
           onOpen={openConnection}
           onRemove={(id) => void removeConnection(id)}
+          theme={theme}
+          setTheme={setTheme}
         />
       </>
     );
@@ -961,9 +1002,16 @@ export default function App() {
   return (
     <>
       {commandMenu}
-      <div className="flex h-full">
+      {/* The shell is panels floating on the canvas: a gutter of --background
+          runs around and between them, so the rail, the query pane and the
+          results read as separate instruments rather than one chrome slab. */}
+      <div className="flex h-full gap-2.5 bg-background p-2.5">
       <Rail
         activeName={active ? active.name : ""}
+        activeUrl={active ? active.url : ""}
+        connections={connections}
+        activeId={activeId}
+        onSwitch={selectConnection}
         onHome={() => setScreen("home")}
         tables={visibleTables}
         tableFilter={tableFilter}
@@ -975,220 +1023,229 @@ export default function App() {
         saved={saved}
         onOpenSaved={openSaved}
         onRemoveSaved={(id) => void removeSaved(id)}
+        theme={theme}
+        setTheme={setTheme}
       />
 
-      <main className="flex min-w-0 flex-1 flex-col">
-        <TabStrip
-          tabs={tabs}
-          activeTabId={activeTabId}
-          onSelect={selectTab}
-          onClose={closeTab}
-          onNew={newTab}
-          chatOpen={showChat}
-          onToggleChat={() => setShowChat((open) => !open)}
-        />
-
-        {/* What a tab is decides what it shows: a table you opened is browsed
-            through its filters, a query tab is written as SQL. There is no
-            mode to switch — the two never applied to the same document. */}
-        {tab.source.kind !== "table" ? (
-          <Editor
-            sql={tab.sql}
-            setSql={(v) => patchTab({ sql: v })}
-            onRun={runEditor}
-            busy={busy}
-            disabled={!active}
-            saveName={saveName}
-            setSaveName={setSaveName}
-            onStartSave={() => setSaveName(tab.name)}
-            onCommitSave={() => void commitSave()}
-            isSaved={tab.savedId > 0}
-            height={editorHeight}
-            setHeight={setEditorHeight}
-          />
-        ) : (
-          <QueryBuilder
-            // Per tab: the half-built predicate you left on one table should
-            // not reappear on the next one.
-            key={tab.id}
-            columns={tab.source.columns}
-            query={tab.source.query}
-            busy={busy}
-            onApply={(next) => void applyQuery(next)}
-            onEditAsSql={editAsSql}
-            buildSql={(q) =>
-              tab.source.kind === "table"
-                ? plainSql(
-                    dialect,
-                    tab.source.table.schema,
-                    tab.source.table.name,
-                    q,
-                    tab.source.pkCols,
-                    tab.source.columns,
-                  )
-                : ""
-            }
-          />
-        )}
-
-        {error && (
-          <div
-            className="flex flex-none items-start gap-2.5 border-b border-destructive/30 bg-destructive/8 px-3 py-2"
-            role="alert"
-          >
-            <span className="pt-0.5 font-mono text-[10px] tracking-[0.1em] text-destructive">
-              error
-            </span>
-            <pre className="m-0 flex-1 font-mono text-[11.5px] break-words whitespace-pre-wrap text-destructive/90">
-              {error}
-            </pre>
-            <Button
-              size="icon-xs"
-              variant="ghost"
-              onClick={() => setError("")}
-              aria-label="Dismiss error"
-            >
-              <X />
-            </Button>
-          </div>
-        )}
-
-        {tab.staged.length > 0 && (
-          <div className="flex flex-none items-center gap-2.5 border-b border-ring bg-amber/8 px-3 py-1.5 font-mono text-[11.5px]">
-            <span className="text-amber">
-              {tab.staged.length} staged edit{tab.staged.length === 1 ? "" : "s"}
-            </span>
-            <span className="text-muted-foreground">
-              {stagedRowCount} row{stagedRowCount === 1 ? "" : "s"} · one transaction
-            </span>
-            <span className="flex-1" />
-            <Button
-              size="sm"
-              variant={showCommit ? "secondary" : "ghost"}
-              onClick={() => setShowCommit((open) => !open)}
-              aria-pressed={showCommit}
-            >
-              {showCommit ? "Hide" : "Review"}
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => patchTab({ staged: [] })}
-              disabled={busy}
-            >
-              Discard
-            </Button>
-            <Button size="sm" onClick={() => void commitStaged()} disabled={busy}>
-              Commit
-            </Button>
-          </div>
-        )}
-
-        {/* A 2px slot that becomes the query-in-flight strip. Always
-            present so nothing shifts when a query starts. */}
-        <div className={cn("h-[2px] flex-none", busy && "loading-strip")} aria-hidden />
-
-        <div className="flex min-h-0 flex-1">
-          <DataGrid
-            page={tab.page}
-            keyed={tab.source.kind === "table"}
-            staged={stagedMap}
-            editable={tab.source.kind === "table"}
-            onStage={stageEdit}
-            sort={tab.source.kind === "table" ? tab.source.query.sort : []}
-            onSort={tab.source.kind === "table" ? toggleSort : undefined}
-            busy={busy}
-            ranEmpty={tab.loaded && tab.source.kind !== "none"}
-            suppressInspector={showCommit}
-            onRowClick={() => setShowCommit(false)}
+      <main className="flex min-w-0 flex-1 flex-col gap-2.5">
+        <section className="float-panel flex flex-none flex-col">
+          <TabStrip
+            tabs={tabs}
+            activeTabId={activeTabId}
+            onSelect={selectTab}
+            onClose={closeTab}
+            onNew={newTab}
+            chatOpen={showChat}
+            onToggleChat={() => setShowChat((open) => !open)}
           />
 
-          {showCommit && tab.source.kind === "table" && tab.staged.length > 0 && (
-            <CommitPanel
-              edits={tab.staged}
-              page={tab.page}
+          {/* What a tab is decides what it shows: a table you opened is browsed
+              through its filters, a query tab is written as SQL. There is no
+              mode to switch — the two never applied to the same document. */}
+          {tab.source.kind !== "table" ? (
+            <Editor
+              sql={tab.sql}
+              setSql={(v) => patchTab({ sql: v })}
+              onRun={runEditor}
               busy={busy}
-              onStage={stageEdit}
-              onClose={() => setShowCommit(false)}
+              disabled={!active}
+              saveName={saveName}
+              setSaveName={setSaveName}
+              onStartSave={() => setSaveName(tab.name)}
+              onCommitSave={() => void commitSave()}
+              isSaved={tab.savedId > 0}
+              height={editorHeight}
+              setHeight={setEditorHeight}
+            />
+          ) : (
+            <QueryBuilder
+              // Per tab: the half-built predicate you left on one table should
+              // not reappear on the next one.
+              key={tab.id}
+              columns={tab.source.columns}
+              query={tab.source.query}
+              busy={busy}
+              onApply={(next) => void applyQuery(next)}
+              onEditAsSql={editAsSql}
+              buildSql={(q) =>
+                tab.source.kind === "table"
+                  ? plainSql(
+                      dialect,
+                      tab.source.table.schema,
+                      tab.source.table.name,
+                      q,
+                      tab.source.pkCols,
+                      tab.source.columns,
+                    )
+                  : ""
+              }
             />
           )}
-        </div>
+        </section>
 
-        <footer className="flex h-7 flex-none items-center gap-3 border-t border-border bg-card px-3 font-mono text-[11px] text-muted-foreground">
-          <span
-            className={cn(
-              "size-1.5 flex-none rounded-full",
-              active ? "bg-amber shadow-[0_0_6px_var(--ring)]" : "bg-faint",
-            )}
-          />
-          <span>
-            {active ? active.name : "not connected"}
-            {tab.status && <span className="text-faint"> · {tab.status}</span>}
-          </span>
-          <span className="flex-1" />
-          {tab.page.cols.length > 0 && (
-            <>
-              <span className="text-faint">
-                {tab.page.cols.length} col{tab.page.cols.length === 1 ? "" : "s"}
+        {/* The results panel. Everything that describes or qualifies the result
+            set — errors, staged edits, the run indicator, the status bar — lives
+            inside it with the grid, so the two never drift apart. */}
+        <section className="float-panel flex min-h-0 flex-1 flex-col">
+          {error && (
+            <div
+              className="flex flex-none items-start gap-2.5 border-b border-destructive/30 bg-destructive/8 px-3 py-2"
+              role="alert"
+            >
+              <span className="pt-0.5 font-mono text-[10px] tracking-[0.1em] text-destructive">
+                error
               </span>
-              <span className="text-faint">
-                {firstRow}–{lastRow}
-                {tab.total !== null && ` of ${tab.total.toLocaleString()}`}
+              <pre className="m-0 flex-1 font-mono text-[11.5px] break-words whitespace-pre-wrap text-destructive/90">
+                {error}
+              </pre>
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                onClick={() => setError("")}
+                aria-label="Dismiss error"
+              >
+                <X />
+              </Button>
+            </div>
+          )}
+
+          {tab.staged.length > 0 && (
+            <div className="flex flex-none items-center gap-2.5 border-b border-ring bg-amber/8 px-3 py-1.5 font-mono text-[11.5px]">
+              <span className="text-amber">
+                {tab.staged.length} staged edit{tab.staged.length === 1 ? "" : "s"}
               </span>
-            </>
-          )}
-          {busy ? (
-            <span className="animate-pulse text-amber">running</span>
-          ) : (
-            tab.elapsed > 0 && <span className="text-faint">{tab.elapsed} ms</span>
-          )}
-          {tab.source.kind !== "none" && (
-            <span className="flex items-center gap-0.5">
-              <Select
-                value={String(tab.pageSize)}
-                onValueChange={(next) => next && void goToPage(0, Number(next))}
+              <span className="text-muted-foreground">
+                {stagedRowCount} row{stagedRowCount === 1 ? "" : "s"} · one transaction
+              </span>
+              <span className="flex-1" />
+              <Button
+                size="sm"
+                variant={showCommit ? "secondary" : "ghost"}
+                onClick={() => setShowCommit((open) => !open)}
+                aria-pressed={showCommit}
+              >
+                {showCommit ? "Hide" : "Review"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => patchTab({ staged: [] })}
                 disabled={busy}
               >
-                <SelectTrigger
-                  size="sm"
-                  className="h-5 w-[78px] border-none font-mono text-[11px] text-faint"
-                  aria-label="Rows per page"
-                >
-                  <SelectValue>{(value) => `${value} rows`}</SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {PAGE_SIZES.map((size) => (
-                    <SelectItem
-                      key={size}
-                      value={String(size)}
-                      className="font-mono text-[11.5px]"
-                    >
-                      {size} rows
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                size="icon-xs"
-                variant="ghost"
-                disabled={tab.pageIndex === 0 || busy}
-                onClick={() => void goToPage(tab.pageIndex - 1)}
-                aria-label="Previous page"
-              >
-                <ChevronLeft />
+                Discard
               </Button>
-              <Button
-                size="icon-xs"
-                variant="ghost"
-                disabled={!tab.page.hasNext || busy}
-                onClick={() => void goToPage(tab.pageIndex + 1)}
-                aria-label="Next page"
-              >
-                <ChevronRight />
+              <Button size="sm" onClick={() => void commitStaged()} disabled={busy}>
+                Commit
               </Button>
-            </span>
+            </div>
           )}
-        </footer>
+
+          {/* A 2px slot that becomes the query-in-flight strip. Always
+              present so nothing shifts when a query starts. */}
+          <div className={cn("h-[2px] flex-none", busy && "loading-strip")} aria-hidden />
+
+          <div className="flex min-h-0 flex-1">
+            <DataGrid
+              page={tab.page}
+              keyed={tab.source.kind === "table"}
+              staged={stagedMap}
+              editable={tab.source.kind === "table"}
+              onStage={stageEdit}
+              sort={tab.source.kind === "table" ? tab.source.query.sort : []}
+              onSort={tab.source.kind === "table" ? toggleSort : undefined}
+              busy={busy}
+              ranEmpty={tab.loaded && tab.source.kind !== "none"}
+              suppressInspector={showCommit}
+              onRowClick={() => setShowCommit(false)}
+            />
+
+            {showCommit && tab.source.kind === "table" && tab.staged.length > 0 && (
+              <CommitPanel
+                edits={tab.staged}
+                page={tab.page}
+                busy={busy}
+                onStage={stageEdit}
+                onClose={() => setShowCommit(false)}
+              />
+            )}
+          </div>
+
+          <footer className="flex h-7 flex-none items-center gap-3 border-t border-border bg-popover px-3 font-mono text-[11px] text-muted-foreground">
+            <span
+              className={cn(
+                "size-1.5 flex-none rounded-full",
+                active ? "bg-amber shadow-[0_0_6px_var(--ring)]" : "bg-faint",
+              )}
+            />
+            <span>
+              {active ? active.name : "not connected"}
+              {tab.status && <span className="text-faint"> · {tab.status}</span>}
+            </span>
+            <span className="flex-1" />
+            {tab.page.cols.length > 0 && (
+              <>
+                <span className="text-faint">
+                  {tab.page.cols.length} col{tab.page.cols.length === 1 ? "" : "s"}
+                </span>
+                <span className="text-faint">
+                  {firstRow}–{lastRow}
+                  {tab.total !== null && ` of ${tab.total.toLocaleString()}`}
+                </span>
+              </>
+            )}
+            {busy ? (
+              <span className="animate-pulse text-amber">running</span>
+            ) : (
+              tab.elapsed > 0 && <span className="text-faint">{tab.elapsed} ms</span>
+            )}
+            {tab.source.kind !== "none" && (
+              <span className="flex items-center gap-0.5">
+                <Select
+                  value={String(tab.pageSize)}
+                  onValueChange={(next) => next && void goToPage(0, Number(next))}
+                  disabled={busy}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    className="h-5 w-[78px] border-none font-mono text-[11px] text-faint"
+                    aria-label="Rows per page"
+                  >
+                    <SelectValue>{(value) => `${value} rows`}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PAGE_SIZES.map((size) => (
+                      <SelectItem
+                        key={size}
+                        value={String(size)}
+                        className="font-mono text-[11.5px]"
+                      >
+                        {size} rows
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  disabled={tab.pageIndex === 0 || busy}
+                  onClick={() => void goToPage(tab.pageIndex - 1)}
+                  aria-label="Previous page"
+                >
+                  <ChevronLeft />
+                </Button>
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  disabled={!tab.page.hasNext || busy}
+                  onClick={() => void goToPage(tab.pageIndex + 1)}
+                  aria-label="Next page"
+                >
+                  <ChevronRight />
+                </Button>
+              </span>
+            )}
+          </footer>
+        </section>
       </main>
 
       {/* The AI chat is its own workspace column, alongside the grid rather
@@ -1217,6 +1274,10 @@ export default function App() {
 
 interface RailProps {
   activeName: string;
+  activeUrl: string;
+  connections: Connection[];
+  activeId: number;
+  onSwitch: (id: number) => void;
   onHome: () => void;
   tables: TableRef[];
   tableFilter: string;
@@ -1228,35 +1289,99 @@ interface RailProps {
   saved: SavedQuery[];
   onOpenSaved: (q: SavedQuery) => void;
   onRemoveSaved: (id: number) => void;
+  theme: Theme;
+  setTheme: (next: Theme) => void;
 }
 
 function Rail(props: RailProps) {
   return (
-    <aside className="flex w-[246px] flex-none flex-col overflow-hidden border-r border-border bg-card">
-      {/* The rail header doubles as the way back to the connections
-          screen — the active database is also the breadcrumb. */}
-      <button
-        className="group flex items-center gap-2 border-b border-border px-3 py-2.5 text-left hover:bg-accent"
-        onClick={props.onHome}
-        title="Back to connections"
-      >
-        <ChevronLeft className="size-3.5 flex-none text-muted-foreground transition-colors group-hover:text-amber" />
-        <span className="min-w-0 flex-1">
-          <span className="block text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">
-            Connection
+    <aside className="float-panel flex w-[252px] flex-none flex-col">
+      {/* Switching databases is a move between workspaces, not a trip back to
+          a menu: the rail header opens the whole set in place, so you land in
+          the new one without losing your bearings. The connections screen is
+          still where you add and remove them, one item down. */}
+      <Menu>
+        <MenuTrigger
+          className="group flex items-center gap-2.5 px-3 py-2.5 text-left outline-none hover:bg-accent data-popup-open:bg-accent"
+          title="Switch connection"
+        >
+          <span className="flex size-7 flex-none items-center justify-center rounded-[9px] border border-amber/25 bg-amber/10">
+            <Logo className="h-3.5 w-auto" />
           </span>
-          <span className="block overflow-hidden text-[12.5px] text-ellipsis whitespace-nowrap text-amber">
-            {props.activeName || "none"}
+          <span className="min-w-0 flex-1">
+            <span className="block overflow-hidden text-[12.5px] font-semibold text-ellipsis whitespace-nowrap text-foreground">
+              {props.activeName || "none"}
+            </span>
+            <span className="block overflow-hidden font-mono text-[10px] text-ellipsis whitespace-nowrap text-faint">
+              {bridgeAvailable() ? originOf(props.activeUrl) : "no bridge"}
+            </span>
           </span>
-        </span>
-        {!bridgeAvailable() && (
-          <span className="font-mono text-[10px] text-destructive">no bridge</span>
-        )}
-      </button>
+          <ChevronsUpDown className="size-3.5 flex-none text-faint transition-colors group-hover:text-amber" />
+        </MenuTrigger>
+        <MenuContent className="w-[280px]">
+          <MenuGroup>
+            <MenuLabel>Connections</MenuLabel>
+            {props.connections.map((c) => {
+              const live = c.id === props.activeId;
+              return (
+                <MenuItem
+                  key={c.id}
+                  onClick={() => !live && props.onSwitch(c.id)}
+                  className={cn(live && "bg-amber/10")}
+                >
+                  <span
+                    className={cn(
+                      "size-1.5 flex-none rounded-full",
+                      live ? "bg-amber shadow-[0_0_6px_var(--ring)]" : "border border-faint",
+                    )}
+                    aria-hidden
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className={cn(
+                        "block overflow-hidden text-ellipsis whitespace-nowrap",
+                        live && "text-amber",
+                      )}
+                    >
+                      {c.name}
+                    </span>
+                    <span className="block overflow-hidden font-mono text-[10px] text-ellipsis whitespace-nowrap text-faint">
+                      {originOf(c.url)}
+                    </span>
+                  </span>
+                  {live && (
+                    <span className="flex-none font-mono text-[9.5px] tracking-[0.16em] text-amber uppercase">
+                      live
+                    </span>
+                  )}
+                </MenuItem>
+              );
+            })}
+          </MenuGroup>
+          <MenuSeparator />
+          <MenuItem onClick={props.onHome} className="text-muted-foreground">
+            <Settings2 />
+            Manage connections…
+          </MenuItem>
+        </MenuContent>
+      </Menu>
 
-      <section className="flex min-h-0 flex-1 flex-col p-3">
-        <h2 className="mb-2 flex items-center justify-between text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">
+      <section className="flex min-h-0 flex-1 flex-col px-2">
+        <div className="relative">
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3 -translate-y-1/2 text-faint" />
+          <Input
+            className="h-8 rounded-md bg-popover pl-7 font-mono text-[11.5px]"
+            value={props.tableFilter}
+            onChange={(e) => props.setTableFilter(e.target.value)}
+            placeholder="Search tables"
+            aria-label="Filter tables"
+          />
+        </div>
+
+        <h2 className="mt-3.5 mb-1 flex items-center gap-2 px-1.5 text-[10px] font-semibold tracking-[0.14em] text-faint uppercase">
           Tables
+          <span className="font-mono tracking-normal">{props.tables.length || ""}</span>
+          <span className="flex-1" />
           <Button
             size="icon-xs"
             variant="ghost"
@@ -1267,30 +1392,28 @@ function Rail(props: RailProps) {
             <RefreshCw />
           </Button>
         </h2>
-        <Input
-          className="h-7 font-mono text-[11.5px]"
-          value={props.tableFilter}
-          onChange={(e) => props.setTableFilter(e.target.value)}
-          placeholder="filter"
-          aria-label="Filter tables"
-        />
-        <ul className="mt-1.5 min-h-0 flex-1 list-none overflow-y-auto p-0">
-          {props.tables.map((t) => (
-            <li
-              key={t.id}
-              className={cn(
-                "flex cursor-pointer items-baseline gap-1.5 border-l-2 border-transparent px-2.5 py-1 font-mono text-[12px] whitespace-nowrap hover:bg-accent",
-                t.id === props.activeTableId && "border-l-amber bg-accent text-amber",
-              )}
-              onClick={() => props.onOpenTable(t)}
-              title={`${t.schema}.${t.name}`}
-            >
-              <span className="text-[10.5px] text-faint">{t.schema}</span>
-              <span className="overflow-hidden text-ellipsis">{t.name}</span>
-            </li>
-          ))}
+        <ul className="min-h-0 flex-1 list-none overflow-y-auto p-0">
+          {props.tables.map((t) => {
+            const active = t.id === props.activeTableId;
+            return (
+              <li
+                key={t.id}
+                className={cn(
+                  "flex cursor-pointer items-baseline gap-1.5 rounded-md px-2 py-1 font-mono text-[12px] whitespace-nowrap",
+                  active ? "bg-amber/10 text-amber" : "hover:bg-accent",
+                )}
+                onClick={() => props.onOpenTable(t)}
+                title={`${t.schema}.${t.name}`}
+              >
+                <span className={cn("text-[10.5px]", active ? "text-amber/70" : "text-faint")}>
+                  {t.schema}
+                </span>
+                <span className="overflow-hidden text-ellipsis">{t.name}</span>
+              </li>
+            );
+          })}
           {props.tables.length === 0 && (
-            <li className="px-2.5 py-1.5 text-[11.5px] text-faint">
+            <li className="px-2 py-1.5 text-[11.5px] text-faint">
               {props.connected ? "No tables." : "Connect to browse."}
             </li>
           )}
@@ -1298,15 +1421,15 @@ function Rail(props: RailProps) {
       </section>
 
       {props.saved.length > 0 && (
-        <section className="flex max-h-[220px] min-h-0 flex-col border-t border-border p-3">
-          <h2 className="mb-2 text-[10px] font-semibold tracking-[0.16em] text-muted-foreground uppercase">
+        <section className="flex max-h-[220px] min-h-0 flex-col border-t border-hairline px-2 py-2">
+          <h2 className="mb-1 px-1.5 text-[10px] font-semibold tracking-[0.14em] text-faint uppercase">
             Saved queries
           </h2>
           <ul className="min-h-0 list-none overflow-y-auto p-0">
             {props.saved.map((q) => (
               <li
                 key={q.id}
-                className="group flex cursor-pointer items-center gap-1.5 rounded-sm px-2 py-1 hover:bg-accent"
+                className="group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 hover:bg-accent"
                 onClick={() => props.onOpenSaved(q)}
                 title={q.sql}
               >
@@ -1329,8 +1452,28 @@ function Rail(props: RailProps) {
           </ul>
         </section>
       )}
+
+      <footer className="flex flex-none items-center gap-2 border-t border-hairline bg-popover px-3 py-1.5">
+        <span className="font-mono text-[10px] tracking-[0.1em] text-faint uppercase">
+          v{__APP_VERSION__}
+        </span>
+        <span className="flex-1" />
+        <ThemeToggle theme={props.theme} setTheme={props.setTheme} />
+      </footer>
     </aside>
   );
+}
+
+/// The host a connection points at, for the rail's second line: `localhost:5432`
+/// for a server, the file name for SQLite. The full URL would carry a password
+/// and would not fit anyway.
+function originOf(url: string): string {
+  if (url.startsWith("sqlite:")) {
+    const path = url.slice("sqlite:".length);
+    return path.split("/").pop() || path;
+  }
+  const match = /^[a-z+]+:\/\/(?:[^@/]*@)?([^/?#]+)/i.exec(url);
+  return match ? match[1] : "not connected";
 }
 
 function Editor(props: {
@@ -1397,7 +1540,7 @@ function Editor(props: {
   return (
     <section
       ref={sectionRef}
-      className="relative flex flex-none flex-col gap-2 border-b border-border p-3"
+      className="relative flex flex-none flex-col gap-2 p-2.5"
     >
       <div className="flex items-stretch gap-2.5">
         <SqlEditor

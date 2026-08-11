@@ -559,7 +559,7 @@ export default function ChatPanel(props: Props) {
 
   return (
     <aside
-      className="flex w-[380px] flex-none flex-col border-l border-border bg-card"
+      className="float-panel flex w-[380px] flex-none flex-col"
       aria-label="AI chat"
     >
       <header className="flex flex-none items-center gap-2 border-b border-hairline px-3 py-2">

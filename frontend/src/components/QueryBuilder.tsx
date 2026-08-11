@@ -293,7 +293,10 @@ export default function QueryBuilder(props: Props) {
   const hidden = new Set(draft.hidden);
 
   return (
-    <section className="flex max-h-[45%] flex-none flex-col gap-2.5 overflow-auto border-b border-border px-3 py-2.5">
+    // The cap is in pixels rather than a percentage: the query panel around it
+    // is sized by its content now, so there is no definite height to take 45%
+    // of — a percentage there silently clipped the SQL preview off the bottom.
+    <section className="flex max-h-[300px] flex-none flex-col gap-2.5 overflow-auto px-3 py-2.5">
       <Field label="where">{renderGroup(draft.where, 0, true)}</Field>
 
       <Field label="columns">

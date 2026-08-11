@@ -8,6 +8,7 @@
 import { useState } from "react";
 import { FolderOpen, Plus, Trash2 } from "lucide-react";
 import Logo from "@/components/Logo";
+import ThemeToggle from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { bridgeAvailable, pickSqliteFile } from "@/lib/bridge";
@@ -27,6 +28,7 @@ import {
   type ConnectionFields,
 } from "@/lib/pgurl";
 import { DB_KINDS, connectionKind, type DbKind } from "@/lib/db";
+import type { Theme } from "@/lib/theme";
 import type { Connection } from "@/lib/store";
 
 /// A connection URL for one engine. SQLite is `sqlite:<path>`; Postgres keeps
@@ -51,6 +53,8 @@ interface Props {
   onAdd: () => void;
   onOpen: (id: number) => void;
   onRemove: (id: number) => void;
+  theme: Theme;
+  setTheme: (next: Theme) => void;
 }
 
 export default function Connections(props: Props) {
@@ -106,15 +110,18 @@ export default function Connections(props: Props) {
               </p>
             </div>
           </div>
-          <div className="hidden flex-col items-end gap-1 font-mono text-[10px] tracking-[0.12em] text-faint uppercase sm:flex">
-            <span className="flex items-center gap-1.5 text-muted-foreground">
-              <span className="size-1.5 rounded-full bg-amber shadow-[0_0_6px_var(--ring)]" />
-              online
-            </span>
-            <span>
-              {props.connections.length} conn · {kinds.size || 0} engine
-              {kinds.size === 1 ? "" : "s"}
-            </span>
+          <div className="flex items-end gap-3">
+            <div className="hidden flex-col items-end gap-1 font-mono text-[10px] tracking-[0.12em] text-faint uppercase sm:flex">
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <span className="size-1.5 rounded-full bg-amber shadow-[0_0_6px_var(--ring)]" />
+                online
+              </span>
+              <span>
+                {props.connections.length} conn · {kinds.size || 0} engine
+                {kinds.size === 1 ? "" : "s"}
+              </span>
+            </div>
+            <ThemeToggle theme={props.theme} setTheme={props.setTheme} />
           </div>
         </header>
 
