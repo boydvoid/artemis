@@ -4,6 +4,7 @@
 import { useEffect, useRef } from "react";
 import type * as Monaco from "monaco-editor";
 import monaco, { installKeywordUpcase } from "@/lib/monaco";
+import { editorThemeName } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
 export default function SqlEditor(props: {
@@ -41,7 +42,10 @@ export default function SqlEditor(props: {
     const editor = monaco.editor.create(host, {
       value: props.value,
       language: "pgsql", // the backend is psql; pgsql knows its functions
-      theme: "artemis",
+      // Whichever theme is current: `create` sets Monaco's global theme, so a
+      // fixed name here would undo a light/dark switch made before this tab
+      // was opened.
+      theme: editorThemeName(),
       placeholder: "SELECT * FROM ...",
       fontFamily: "'IBM Plex Mono', monospace",
       fontSize: 12.5,
@@ -115,7 +119,9 @@ export default function SqlEditor(props: {
     <div
       ref={hostRef}
       className={cn(
-        "overflow-hidden rounded-md border border-input bg-background",
+        // A well sunk into the query panel, matching Monaco's own background
+        // in lib/monaco.ts — the seam between the two must not show.
+        "overflow-hidden rounded-md border border-hairline bg-popover",
         props.className,
       )}
       style={props.style}

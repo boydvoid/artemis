@@ -1,10 +1,15 @@
 /* Artemis — engineering-instrument aesthetic on shadcn/Tailwind.
-   Near-black ground, hairline rules, one phosphor-amber accent carrying
-   every signal. The data plane is monospace end to end so columns align
-   optically as well as geometrically.
+   Hairline rules, one phosphor-amber accent carrying every signal, and a data
+   plane that is monospace end to end so columns align optically as well as
+   geometrically.
 
-   The app is dark-only by design (a tool you stare at for hours), so the
-   dark values live in :root and .dark alike rather than behind a toggle. */
+   Two palettes, one structure. `:root` is light, `.dark` is dark, and the
+   class on <html> is decided before first paint (see index.html and
+   lib/theme.ts). Nothing in the app names a colour directly: the shell is
+   built from --background (the canvas the panels float on), --card (a floating
+   panel), --popover (a well inside one), --hairline and --border (two weights
+   of rule), and --amber (the one saturated colour, meaning "this is the live
+   one"). Retuning either palette here retunes the whole app. */
 
 @import "tailwindcss";
 @import "tw-animate-css";
@@ -46,6 +51,8 @@
   --color-amber: var(--amber);
   --color-hairline: var(--hairline);
   --color-faint: var(--faint);
+  /* Registration ticks and other drafting marks. */
+  --color-tick: var(--tick);
 
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
@@ -56,37 +63,85 @@
   --spacing-row: 27px;
 }
 
-:root,
+/* Light: paper, not glare. The canvas is a shade off white so the panels
+   floating on it have something to be lighter than, and amber is taken down
+   to a burnt tone that still passes contrast on white. */
+:root {
+  color-scheme: light;
+
+  --background: #f1f3f5;
+  --foreground: #15181b;
+  --card: #ffffff;
+  --card-foreground: #15181b;
+  --popover: #f6f7f9;
+  --popover-foreground: #15181b;
+
+  --primary: #b06105;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f6f7f9;
+  --secondary-foreground: #15181b;
+  --muted: #f6f7f9;
+  --muted-foreground: #59636b;
+  --accent: #edf0f3;
+  --accent-foreground: #15181b;
+  --destructive: #dc2626;
+
+  --border: #e3e6ea;
+  --input: #e3e6ea;
+  --ring: #e0a24a;
+
+  --amber: #b06105;
+  --hairline: #ebeef1;
+  --faint: #8a9299;
+  --tick: #a6aeb6;
+
+  /* The drafting grid on the home screen, and the lift under a floating
+     panel. Both are the same idea: enough to read as depth, not enough to
+     become decoration. */
+  --grid: rgba(15, 23, 42, 0.1);
+  --bloom: rgba(176, 97, 5, 0.05);
+  --shadow: rgba(15, 23, 42, 0.1);
+
+  --radius: 0.375rem;
+}
+
+/* Dark: the original instrument face. Near-black ground, phosphor amber. */
 .dark {
-  --background: #0b0c0d;
-  --foreground: #dfe3e6;
-  --card: #101214;
-  --card-foreground: #dfe3e6;
-  --popover: #16191c;
-  --popover-foreground: #dfe3e6;
+  color-scheme: dark;
+
+  --background: #0a0b0c;
+  --foreground: #e7ebee;
+  --card: #121416;
+  --card-foreground: #e7ebee;
+  --popover: #191c1f;
+  --popover-foreground: #e7ebee;
 
   /* Amber is the only saturated colour in the app; it means "this is the
      live one" — active connection, staged edit, primary action. */
-  --primary: #ffb000;
-  --primary-foreground: #17130a;
+  --primary: #ffb020;
+  --primary-foreground: #1a1204;
 
-  --secondary: #16191c;
-  --secondary-foreground: #dfe3e6;
-  --muted: #16191c;
-  --muted-foreground: #7d868c;
-  --accent: #1a1d20;
-  --accent-foreground: #dfe3e6;
-  --destructive: #ff5f56;
+  --secondary: #191c1f;
+  --secondary-foreground: #e7ebee;
+  --muted: #191c1f;
+  --muted-foreground: #98a1a8;
+  --accent: #1e2327;
+  --accent-foreground: #e7ebee;
+  --destructive: #ff6b60;
 
-  --border: #232729;
-  --input: #232729;
+  --border: #24292e;
+  --input: #24292e;
   --ring: #7a5600;
 
-  --amber: #ffb000;
-  --hairline: #1a1d20;
-  --faint: #4c5459;
+  --amber: #ffb020;
+  --hairline: #1b2024;
+  --faint: #69727a;
+  --tick: #5a626a;
 
-  --radius: 0.375rem;
+  --grid: rgba(255, 255, 255, 0.075);
+  --bloom: rgba(255, 176, 32, 0.055);
+  --shadow: rgba(0, 0, 0, 0.45);
 }
 
 @layer base {
@@ -174,15 +229,25 @@
     background: var(--popover);
   }
 
-  /* Revealed on header hover only — 26 columns should not read as 26
-     handles. */
+  /* A floating panel: the shell is made of these, sitting on the canvas with
+     a gutter of --background all the way around rather than butting against
+     the window edge. The lift is a single soft shadow — enough to separate
+     the panel from the canvas, not enough to read as a card. */
+  .float-panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px -10px var(--shadow);
+    overflow: hidden;
+  }
+
   /* The home screen reads as a powered instrument face, not a flat void:
-     a faint graph-paper grid and a warm phosphor bloom at the top, both
-     masked so they dissolve into the dark rather than tile edge to edge. */
+     a graph-paper grid and a warm phosphor bloom at the top, both masked so
+     they dissolve into the ground rather than tile edge to edge. */
   .home-surface {
     position: relative;
     background:
-      radial-gradient(110% 60% at 50% -8%, rgba(255, 176, 0, 0.055), transparent 62%),
+      radial-gradient(110% 60% at 50% -8%, var(--bloom), transparent 62%),
       var(--background);
   }
   .home-surface::before {
@@ -190,12 +255,11 @@
     position: absolute;
     inset: 0;
     background-image:
-      linear-gradient(var(--hairline) 1px, transparent 1px),
-      linear-gradient(90deg, var(--hairline) 1px, transparent 1px);
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
     background-size: 46px 46px;
     background-position: center top;
     mask-image: radial-gradient(88% 72% at 50% 12%, #000 0%, transparent 78%);
-    opacity: 0.55;
     pointer-events: none;
   }
   .home-surface > * {
@@ -242,7 +306,7 @@
     position: absolute;
     width: 7px;
     height: 7px;
-    border-color: color-mix(in oklch, var(--muted-foreground) 45%, transparent);
+    border-color: var(--tick);
     pointer-events: none;
   }
 

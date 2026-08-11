@@ -26,7 +26,7 @@ interface Props {
 
 export default function TabStrip(props: Props) {
   return (
-    <div className="flex flex-none items-center border-b border-border px-2 pt-1.5">
+    <div className="flex flex-none items-center gap-1 border-b border-hairline px-2 py-1.5">
       {/* Tabs scroll horizontally within the flexible space so a long list
           never pushes the pinned AI action off the right edge. */}
       <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto scrollbar-none">
@@ -40,9 +40,11 @@ export default function TabStrip(props: Props) {
           <div
             key={tab.id}
             className={cn(
-              "group flex h-7 flex-none cursor-pointer items-center gap-1.5 rounded-t-md border border-b-0 px-2.5 text-[12px]",
+              // Free-standing pills rather than folder tabs: the strip now sits
+              // inside a floating panel, so there is no seam below to attach to.
+              "group flex h-7 flex-none cursor-pointer items-center gap-1.5 rounded-md border px-2.5 text-[12px]",
               active
-                ? "border-border bg-background text-foreground"
+                ? "border-border bg-popover text-foreground"
                 : "border-transparent text-muted-foreground hover:bg-accent hover:text-foreground",
             )}
             onClick={() => props.onSelect(tab.id)}
@@ -103,7 +105,7 @@ export default function TabStrip(props: Props) {
       <Button
         size="sm"
         variant={props.chatOpen ? "secondary" : "ghost"}
-        className={cn("mb-1 ml-0.5 flex-none gap-1.5", props.chatOpen && "text-amber")}
+        className={cn("flex-none gap-1.5", props.chatOpen && "text-amber")}
         onClick={props.onToggleChat}
         aria-pressed={props.chatOpen}
         title="AI chat (⌘J)"

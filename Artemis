@@ -1,0 +1,18 @@
+{
+  "version": "2.14",
+  "children": [
+    {
+      "type": "frame",
+      "id": "bi8Au",
+      "x": 384,
+      "y": 81,
+      "name": "Frame",
+      "clip": true,
+      "width": 800,
+      "height": 600,
+      "fill": "#FFFFFF",
+      "layout": "none"
+    }
+  ],
+  "fileToken": "86546db0-bbe2-478e-9d36-ee7ea956b337"
+}
