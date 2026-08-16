@@ -354,6 +354,12 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         }
         app_mod.linkFramework("AppKit", .{});
         app_mod.linkFramework("AVFoundation", .{});
+        // The SDK's AppKit host captures screen audio through ScreenCaptureKit
+        // (macOS 12.3+, so weak-linked to keep the 11.0 deployment target) and
+        // reads the sample buffers with CoreMedia/CoreVideo.
+        app_mod.linkFramework("CoreMedia", .{});
+        app_mod.linkFramework("ScreenCaptureKit", .{ .weak = true });
+        app_mod.linkFramework("CoreVideo", .{});
         app_mod.linkFramework("MediaToolbox", .{});
         app_mod.linkFramework("Accelerate", .{});
         app_mod.linkFramework("Foundation", .{});

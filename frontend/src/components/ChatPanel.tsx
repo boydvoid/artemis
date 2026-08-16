@@ -1,17 +1,24 @@
 // The AI chat panel.
 //
-// A right-side panel that talks to a local Ollama model to help build queries
-// and reports. It streams token-by-token (the native shell pushes `ollama.token`
-// events), and every SQL block the model produces gets a "Send to editor"
-// action that opens it as a fresh query tab — the draft-into-editor stage, so
-// the human always reviews and runs. The model has the connection's table list
-// as context, so its SQL targets the live database in the right dialect.
+// A right-side panel that talks to a model to help build queries and
+// reports. Three backends, one conversation: a local Ollama daemon, or the
+// Claude Code / Codex CLI the user has already signed into — which is how a
+// subscription gets used here, since the CLI's own login is the credential
+// and no API key is ever entered.
+//
+// It streams token-by-token (the native shell pushes `ollama.token` /
+// `agent.token` events), and every SQL block the model produces gets a
+// "Send to editor" action that opens it as a fresh query tab — the
+// draft-into-editor stage, so the human always reviews and runs. The model
+// has the connection's table list as context, so its SQL targets the live
+// database in the right dialect.
 //
 // Composed from the shadcn chat primitives: MessageScroller owns streaming
 // scroll behaviour, Message/Bubble the layout, Marker the system notes.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Bot, ChevronDown, ChevronRight, RefreshCw, Settings2, Square, User, X } from "lucide-react";
+import { ArrowUp, Bot, ChevronDown, ChevronRight, Plus, RefreshCw, Settings2, Square, Trash2, User, X } from "lucide-react";
+import { Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "@/components/ui/menu";
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -50,13 +57,41 @@ import {
   type ChatMessage,
   type OllamaModel,
 } from "@/lib/ollama";
+import {
+  AgentError,
+  agentChat,
+  agentStatus,
+  buildTurn,
+  INSTALL_HINTS,
+  isCliProvider,
+  LOGIN_HINTS,
+  MODEL_SUGGESTIONS,
+  PROVIDER_BLURBS,
+  PROVIDER_LABELS,
+  PROVIDER_SHORT_LABELS,
+  PROVIDERS,
+  turnKey,
+  type AgentStatus,
+  type CliProvider,
+  type Provider,
+} from "@/lib/agent";
+import type { AiSettings } from "@/lib/aiStore";
+import {
+  createChatSession,
+  deleteChatSession,
+  listChatSessions,
+  loadTranscript,
+  saveTranscript,
+  titleFrom,
+  updateChatSession,
+  type ChatSessionRow,
+} from "@/lib/chatStore";
 import type { ColumnValues, ForeignKeyRef, SchemaColumns, TableRef } from "@/lib/parse";
 
 interface Props {
-  endpoint: string;
-  setEndpoint: (endpoint: string) => void;
-  model: string;
-  setModel: (model: string) => void;
+  /// Which backend to run on, and every backend's own settings.
+  settings: AiSettings;
+  updateSettings: (patch: Partial<AiSettings>) => void;
   /// The active connection's tables, handed to the model as schema context.
   tables: TableRef[];
   /// Columns per table (`schema.name` → columns), so the model uses real
@@ -75,6 +110,9 @@ interface Props {
   /// syntax.
   dialectName: string;
   connectionName: string;
+  /// The active connection's row id. Conversations are stored against it —
+  /// a chat is about one database's schema.
+  connectionId: number;
   /// Open a SQL statement as a new query tab.
   onSendToEditor: (sql: string) => void;
   onClose: () => void;
@@ -319,11 +357,17 @@ function localToday(): string {
   return `${y}-${m}-${d}`;
 }
 
+/// Which of the per-provider settings fields hold this CLI's model and
+/// binary path, so one set of controls can drive either.
+const CLI_FIELDS: Record<CliProvider, { model: keyof AiSettings; binary: keyof AiSettings }> = {
+  claude: { model: "claudeModel", binary: "claudeBinary" },
+  codex: { model: "codexModel", binary: "codexBinary" },
+};
+
 export default function ChatPanel(props: Props) {
   const {
-    endpoint,
-    model,
-    setModel,
+    settings,
+    updateSettings,
     tables,
     schema,
     foreignKeys,
@@ -331,8 +375,19 @@ export default function ChatPanel(props: Props) {
     runProbe,
     dialectName,
     connectionName,
+    connectionId,
     onSendToEditor,
   } = props;
+
+  const provider = settings.provider;
+  const endpoint = settings.endpoint;
+  const cli = isCliProvider(provider) ? provider : null;
+  const cliModel = cli ? (settings[CLI_FIELDS[cli].model] as string) : "";
+  const cliBinary = cli ? (settings[CLI_FIELDS[cli].binary] as string) : "";
+  /// The model in force, whichever backend is selected. Empty on a CLI
+  /// means "the CLI's own default", which is a usable state — unlike
+  /// Ollama, where a model must be named.
+  const model = cli ? cliModel : settings.model;
 
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
@@ -343,6 +398,14 @@ export default function ChatPanel(props: Props) {
   const [showSettings, setShowSettings] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const [endpointDraft, setEndpointDraft] = useState(endpoint);
+  /// What was found when we looked for the selected CLI. Null while the
+  /// look-up is still running, or when the backend is Ollama.
+  const [cliStatus, setCliStatus] = useState<AgentStatus | null>(null);
+  /// Stored conversations for this connection, most recent first, and which
+  /// one is open. Null means an unsaved chat: no row exists until the first
+  /// message, so browsing never leaves empty threads behind.
+  const [sessions, setSessions] = useState<ChatSessionRow[]>([]);
+  const [sessionId, setSessionId] = useState<number | null>(null);
 
   // What the model is actually told about the database. Surfaced so a wrong
   // or empty schema is visible instead of guessed at: if "with columns" is 0,
@@ -358,12 +421,15 @@ export default function ChatPanel(props: Props) {
     .filter(Boolean)
     .join("\n");
 
-  const handleRef = useRef<ChatHandle | null>(null);
+  /// The in-flight stream, whichever backend produced it. Only `cancel` is
+  /// needed here, and both handles offer it.
+  const handleRef = useRef<Pick<ChatHandle, "cancel"> | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   /// Load the model list from the daemon. Picks a default model when none is
   /// chosen yet, and surfaces a readable message when Ollama is unreachable.
   const refreshModels = useCallback(async () => {
+    if (provider !== "ollama") return;
     if (!bridgeAvailable()) {
       setModelsError("Run the app with the native shell to reach Ollama.");
       return;
@@ -376,7 +442,7 @@ export default function ChatPanel(props: Props) {
       if (list.length === 0) {
         setModelsError("No models installed. Pull one with `ollama pull <model>`.");
       } else if (!list.some((m) => m.name === model)) {
-        setModel(list[0].name);
+        updateSettings({ model: list[0].name });
       }
     } catch (error) {
       setModelsError(error instanceof OllamaError ? error.message : String(error));
@@ -384,13 +450,38 @@ export default function ChatPanel(props: Props) {
       setLoadingModels(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [endpoint, model]);
+  }, [endpoint, model, provider]);
 
-  // Load models on mount and whenever the endpoint changes.
+  // Load models on mount and whenever the endpoint or backend changes.
   useEffect(() => {
     void refreshModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [endpoint]);
+  }, [endpoint, provider]);
+
+  /// Look for the selected CLI. Cheap (`--version`) and worth doing up
+  /// front: "not installed" and "installed but signed out" are the two
+  /// states a user hits first, and neither should cost a request to learn.
+  const refreshCliStatus = useCallback(async () => {
+    if (!cli) {
+      setCliStatus(null);
+      return;
+    }
+    if (!bridgeAvailable()) {
+      setCliStatus({
+        installed: false,
+        path: "",
+        version: "",
+        message: "Run the app with the native shell to reach the CLI.",
+      });
+      return;
+    }
+    setCliStatus(null);
+    setCliStatus(await agentStatus(cli, cliBinary));
+  }, [cli, cliBinary]);
+
+  useEffect(() => {
+    void refreshCliStatus();
+  }, [refreshCliStatus]);
 
   // A cancelled/aborted stream must not keep updating state after unmount.
   useEffect(() => {
@@ -417,6 +508,125 @@ export default function ChatPanel(props: Props) {
   /// Stop pressed: ends the probe loop as well as the current stream.
   const abortRef = useRef(false);
 
+  /// The CLI conversation this panel is continuing, and the setup it was
+  /// started with. A resumed session already holds the schema and the
+  /// history, so only the new message is sent — which on a rate-limited
+  /// subscription is the difference between one schema upload and one per
+  /// message. Any change to the setup invalidates it: the session was
+  /// created under the old system prompt and cannot be told about the new
+  /// one.
+  const sessionRef = useRef<{ key: string; id: string } | null>(null);
+
+  /// The rendered conversation, mirrored into a ref so the save that runs
+  /// when a turn finishes reads what is on screen rather than the value
+  /// captured when the send started.
+  const turnsRef = useRef<Turn[]>([]);
+  useEffect(() => {
+    turnsRef.current = turns;
+  }, [turns]);
+
+  /// Open a stored conversation: both transcripts, and the CLI handle it was
+  /// built on. Switching also switches the backend back — the handle belongs
+  /// to that CLI, and continuing a Claude thread under Codex is nonsense.
+  const openChat = useCallback(
+    async (row: ChatSessionRow) => {
+      handleRef.current?.cancel();
+      abortRef.current = true;
+      const transcript = await loadTranscript(row.id);
+      convoRef.current = transcript.model;
+      sessionRef.current =
+        row.cliSession && row.sessionKey ? { key: row.sessionKey, id: row.cliSession } : null;
+      setTurns(
+        transcript.display.map((stored) => ({
+          id: nextTurnId(),
+          role: stored.role,
+          content: stored.content,
+          kind: stored.kind === "probe-result" ? "probe-result" : undefined,
+          note: stored.note || undefined,
+          error: stored.error || undefined,
+        })),
+      );
+      setSessionId(row.id);
+      if (row.provider && row.provider !== provider) updateSettings({ provider: row.provider });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    },
+    [provider],
+  );
+
+  /// Start over. The row for the current chat stays; this one materialises
+  /// on its first message.
+  const newChat = useCallback(() => {
+    handleRef.current?.cancel();
+    abortRef.current = true;
+    convoRef.current = [];
+    sessionRef.current = null;
+    setTurns([]);
+    setSessionId(null);
+  }, []);
+
+  // Load this connection's conversations, and reopen the most recent one so
+  // toggling the panel (or restarting the app) does not lose the thread.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      if (connectionId <= 0 || !bridgeAvailable()) {
+        setSessions([]);
+        return;
+      }
+      const rows = await listChatSessions(connectionId);
+      if (cancelled) return;
+      setSessions(rows);
+      if (rows.length > 0) await openChat(rows[0]);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionId]);
+
+  /// Write the conversation to the store. Creates its row on the first save,
+  /// naming it after the opening message.
+  const persist = useCallback(
+    async (currentTurns: Turn[]) => {
+      if (connectionId <= 0 || currentTurns.length === 0 || !bridgeAvailable()) return;
+      let id = sessionId;
+      if (id === null) {
+        const opening = currentTurns.find((t) => t.role === "user" && t.kind !== "probe-result");
+        id = await createChatSession(connectionId, provider, titleFrom(opening?.content ?? ""));
+        if (id === null) return;
+        setSessionId(id);
+      }
+      await saveTranscript(
+        id,
+        currentTurns.map((turn) => ({
+          role: turn.role,
+          content: turn.content,
+          kind: turn.kind ?? "",
+          note: turn.note ?? "",
+          error: turn.error ?? false,
+        })),
+        convoRef.current,
+      );
+      await updateChatSession(id, {
+        provider,
+        cliSession: sessionRef.current?.id ?? "",
+        sessionKey: sessionRef.current?.key ?? "",
+      });
+      setSessions(await listChatSessions(connectionId));
+    },
+    [connectionId, provider, sessionId],
+  );
+
+  // Save when a turn finishes rather than as it streams: one write per
+  // exchange instead of one per token, and by then the panel state is the
+  // finished thing worth storing.
+  const wasStreaming = useRef(false);
+  useEffect(() => {
+    if (wasStreaming.current && !streaming) void persist(turnsRef.current);
+    wasStreaming.current = streaming;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streaming]);
+
   /// Stream one assistant reply into a fresh display turn. Resolves with the
   /// full text plus the failure that ended it early, if any — never rejects.
   const streamOnce = useCallback(
@@ -426,32 +636,71 @@ export default function ChatPanel(props: Props) {
         { id: nextTurnId(), role: "assistant", content: "", pending: true },
       ]);
       let content = "";
-      const handle = chat({
-        endpoint,
-        model,
-        messages,
-        onToken: (delta) => {
-          content += delta;
-          patchLastAssistant((t) => ({ ...t, content: t.content + delta, pending: false }));
-        },
+      const onToken = (delta: string) => {
+        content += delta;
+        patchLastAssistant((t) => ({ ...t, content: t.content + delta, pending: false }));
+      };
+
+      if (!cli) {
+        const handle = chat({ endpoint, model, messages, onToken });
+        handleRef.current = handle;
+        return handle.done
+          .then(() => ({ content, failure: null as string | null }))
+          .catch((error) => ({
+            content,
+            failure: error instanceof OllamaError ? error.message : String(error),
+          }))
+          .finally(() => {
+            handleRef.current = null;
+          });
+      }
+
+      const system = messages.find((m) => m.role === "system")?.content ?? "";
+      const key = turnKey(cli, cliModel, cliBinary, system);
+      const resumable = sessionRef.current?.key === key ? sessionRef.current.id : "";
+      const turn = buildTurn(cli, system, messages, resumable);
+
+      const handle = agentChat({
+        provider: cli,
+        binary: cliBinary,
+        model: cliModel,
+        system: turn.system,
+        prompt: turn.prompt,
+        session: turn.session,
+        onToken,
       });
       handleRef.current = handle;
       return handle.done
-        .then(() => ({ content, failure: null as string | null }))
-        .catch((error) => ({
-          content,
-          failure: error instanceof OllamaError ? error.message : String(error),
-        }))
+        .then((result) => {
+          sessionRef.current = result.session ? { key, id: result.session } : null;
+          return { content, failure: null as string | null };
+        })
+        .catch((error) => {
+          // Resuming into a conversation that just failed only repeats the
+          // failure, so the next message starts a fresh session.
+          sessionRef.current = null;
+          return {
+            content,
+            failure: error instanceof AgentError ? error.message : String(error),
+          };
+        })
         .finally(() => {
           handleRef.current = null;
         });
     },
-    [endpoint, model, patchLastAssistant],
+    [cli, cliBinary, cliModel, endpoint, model, patchLastAssistant],
   );
+
+  /// Can this backend take a message? Ollama needs a chosen model; a CLI
+  /// needs to exist. An unfinished look-up counts as ready — the CLI's own
+  /// error is a better answer than a disabled button.
+  const backendReady = cli ? cliStatus?.installed !== false : !!model;
+  /// Whichever "am I usable" check this backend runs is in flight.
+  const checking = cli ? cliStatus === null : loadingModels;
 
   const send = useCallback(() => {
     const text = input.trim();
-    if (text.length === 0 || streaming || !model) return;
+    if (text.length === 0 || streaming || !backendReady) return;
 
     setTurns((prev) => [...prev, { id: nextTurnId(), role: "user", content: text }]);
     setInput("");
@@ -534,7 +783,7 @@ export default function ChatPanel(props: Props) {
         setStreaming(false);
       }
     })();
-  }, [input, streaming, model, tables, schema, foreignKeys, valueCatalog, dialectName, connectionName, streamOnce, runProbe, patchLastAssistant]);
+  }, [input, streaming, backendReady, tables, schema, foreignKeys, valueCatalog, dialectName, connectionName, streamOnce, runProbe, patchLastAssistant]);
 
   const stop = useCallback(() => {
     abortRef.current = true;
@@ -551,29 +800,106 @@ export default function ChatPanel(props: Props) {
 
   function applyEndpoint() {
     const next = endpointDraft.trim();
-    if (next.length > 0 && next !== endpoint) props.setEndpoint(next);
+    if (next.length > 0 && next !== endpoint) updateSettings({ endpoint: next });
     setShowSettings(false);
   }
 
-  const canSend = input.trim().length > 0 && !streaming && !!model;
+  /// Switching backend mid-conversation is allowed — the transcript is ours,
+  /// not the model's — but the CLI session handle belongs to the old one.
+  function selectProvider(next: Provider) {
+    if (next === provider) return;
+    sessionRef.current = null;
+    updateSettings({ provider: next });
+  }
+
+  function updateCli(field: "model" | "binary", value: string) {
+    if (!cli) return;
+    sessionRef.current = null;
+    updateSettings({ [CLI_FIELDS[cli][field]]: value });
+  }
+
+  async function removeChat(row: ChatSessionRow) {
+    await deleteChatSession(row.id);
+    if (row.id === sessionId) newChat();
+    setSessions(await listChatSessions(connectionId));
+  }
+
+  /// The open conversation's name. An unsaved chat has no row yet, so it is
+  /// named from what has been typed so far — the same rule the row will get.
+  const openSession = sessions.find((s) => s.id === sessionId) ?? null;
+  const firstUserTurn = turns.find((t) => t.role === "user" && t.kind !== "probe-result");
+  const chatTitle =
+    openSession?.title || (firstUserTurn ? titleFrom(firstUserTurn.content) : "New chat");
+
+  const canSend = input.trim().length > 0 && !streaming && backendReady;
 
   return (
     <aside
       className="float-panel flex w-[380px] flex-none flex-col"
       aria-label="AI chat"
     >
-      <header className="flex flex-none items-center gap-2 border-b border-hairline px-3 py-2">
+      <header className="flex flex-none items-center gap-1 border-b border-hairline px-3 py-2">
         <Bot className="size-3.5 flex-none text-amber" />
-        <span className="font-mono text-[10px] tracking-[0.1em] text-faint uppercase">chat</span>
-        {/* Name the provider: Ollama is the only backend for now, and saying so
-            sets the expectation that this is local-only. */}
-        <span
-          className="rounded-full border border-border px-1.5 py-px font-mono text-[9.5px] tracking-[0.08em] text-faint uppercase"
-          title="Local models via Ollama. API keys and custom providers are coming."
+        {/* The conversation, named and switchable. Chats are stored per
+            connection and reopened on the next visit, so the panel needs a
+            way to say which one you are in and to get back to the others. */}
+        <Menu>
+          <MenuTrigger
+            className="flex min-w-0 flex-1 items-center gap-1 rounded-md px-1.5 py-0.5 text-left outline-none hover:bg-accent data-popup-open:bg-accent"
+            title="Switch conversation"
+            aria-label="Conversations"
+          >
+            <span className="truncate font-mono text-[11px] text-muted-foreground">
+              {chatTitle}
+            </span>
+            <ChevronDown className="size-3 flex-none text-faint" />
+          </MenuTrigger>
+          <MenuContent align="start" className="w-[300px]">
+            <MenuItem onClick={newChat} className="gap-2 font-mono text-[11.5px]">
+              <Plus className="size-3.5 flex-none text-faint" />
+              New chat
+            </MenuItem>
+            {sessions.length > 0 && <MenuSeparator />}
+            {sessions.map((row) => (
+              <MenuItem
+                key={row.id}
+                onClick={() => void openChat(row)}
+                className={cn(
+                  "group gap-2 font-mono text-[11.5px]",
+                  row.id === sessionId && "text-amber",
+                )}
+              >
+                <span className="min-w-0 flex-1 truncate">{row.title || "Untitled"}</span>
+                <span className="flex-none text-[9.5px] text-faint">
+                  {PROVIDER_SHORT_LABELS[row.provider] ?? row.provider}
+                </span>
+                <span
+                  role="button"
+                  tabIndex={-1}
+                  aria-label={`Delete ${row.title || "conversation"}`}
+                  className="flex-none rounded p-0.5 text-faint opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive"
+                  onClick={(event) => {
+                    // The row's own click opens the chat; this one must not.
+                    event.stopPropagation();
+                    event.preventDefault();
+                    void removeChat(row);
+                  }}
+                >
+                  <Trash2 className="size-3" />
+                </span>
+              </MenuItem>
+            ))}
+          </MenuContent>
+        </Menu>
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          onClick={newChat}
+          disabled={turns.length === 0 && sessionId === null}
+          aria-label="New chat"
         >
-          Ollama
-        </span>
-        <span className="flex-1" />
+          <Plus />
+        </Button>
         <Button
           size="icon-xs"
           variant="ghost"
@@ -592,37 +918,92 @@ export default function ChatPanel(props: Props) {
         </button>
       </header>
 
-      {/* Model picker + endpoint. The picker switches the local model mid
-          conversation; the endpoint hides behind the gear. */}
+      {/* Model picker. Ollama has an installed list to choose from; a CLI
+          takes any id its vendor ships, so that one is a free-text field
+          with suggestions and an empty value meaning "the CLI's default". */}
       <div className="flex flex-none flex-col gap-2 border-b border-hairline px-3 py-2">
+        {/* Which backend answers. First control in the panel, and a
+            segmented one — all three destinations visible at once — because
+            the choice decides where the question goes and who pays for the
+            reply. A dropdown here reads as a badge and gets missed. */}
+        <div
+          className="flex items-center gap-0.5 rounded-full border border-hairline bg-background/60 p-0.5"
+          role="group"
+          aria-label="Chat backend"
+        >
+          {PROVIDERS.map((key) => {
+            const active = provider === key;
+            return (
+              <button
+                key={key}
+                className={cn(
+                  "flex-1 rounded-full px-2 py-1 font-mono text-[10.5px] transition-colors",
+                  active
+                    ? "bg-card text-foreground shadow-[0_1px_2px_var(--shadow)]"
+                    : "text-faint hover:text-foreground",
+                )}
+                onClick={() => selectProvider(key)}
+                aria-pressed={active}
+                title={PROVIDER_BLURBS[key]}
+              >
+                {PROVIDER_SHORT_LABELS[key]}
+              </button>
+            );
+          })}
+        </div>
+
         <div className="flex items-center gap-1.5">
-          <Select value={model} onValueChange={(next) => next && setModel(next)} disabled={models.length === 0}>
-            <SelectTrigger
-              size="sm"
-              className="h-7 flex-1 font-mono text-[11.5px]"
-              aria-label="Model"
-            >
-              <SelectValue placeholder={loadingModels ? "loading models…" : "no model"} />
-            </SelectTrigger>
-            <SelectContent>
-              {models.map((m) => (
-                <SelectItem key={m.name} value={m.name} className="font-mono text-[11.5px]">
-                  {m.name}
-                  {m.params && <span className="text-faint"> · {m.params}</span>}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          {cli ? (
+            <>
+              <Input
+                className="h-7 flex-1 font-mono text-[11.5px]"
+                value={cliModel}
+                onChange={(e) => updateCli("model", e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") e.stopPropagation();
+                }}
+                placeholder={`model — blank for the ${PROVIDER_LABELS[cli]} default`}
+                list={`${cli}-model-suggestions`}
+                spellCheck={false}
+                aria-label="Model"
+              />
+              <datalist id={`${cli}-model-suggestions`}>
+                {MODEL_SUGGESTIONS[cli].map((name) => (
+                  <option key={name} value={name} />
+                ))}
+              </datalist>
+            </>
+          ) : (
+            <Select value={model} onValueChange={(next) => next && updateSettings({ model: next })} disabled={models.length === 0}>
+              <SelectTrigger
+                size="sm"
+                className="h-7 flex-1 font-mono text-[11.5px]"
+                aria-label="Model"
+              >
+                <SelectValue placeholder={loadingModels ? "loading models…" : "no model"} />
+              </SelectTrigger>
+              <SelectContent>
+                {models.map((m) => (
+                  <SelectItem key={m.name} value={m.name} className="font-mono text-[11.5px]">
+                    {m.name}
+                    {m.params && <span className="text-faint"> · {m.params}</span>}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
           <Button
             size="icon-sm"
             variant="ghost"
-            onClick={() => void refreshModels()}
-            disabled={loadingModels}
-            aria-label="Reload models"
+            onClick={() => void (cli ? refreshCliStatus() : refreshModels())}
+            disabled={checking}
+            aria-label={cli ? "Re-check the CLI" : "Reload models"}
           >
-            <RefreshCw className={cn(loadingModels && "animate-spin")} />
+            <RefreshCw className={cn(checking && "animate-spin")} />
           </Button>
         </div>
+
+        {cli && <CliStatusLine provider={cli} status={cliStatus} />}
 
         {/* The schema context sent with every message. The summary makes the
             failure mode ("0 with columns") visible; expanding shows the exact
@@ -657,7 +1038,7 @@ export default function ChatPanel(props: Props) {
           )}
         </div>
 
-        {showSettings && (
+        {showSettings && !cli && (
           <div className="flex flex-col gap-1.5">
             <label className="font-mono text-[9.5px] tracking-[0.1em] text-faint uppercase">
               Ollama endpoint
@@ -683,12 +1064,40 @@ export default function ChatPanel(props: Props) {
               </Button>
             </div>
             <p className="text-[10.5px] leading-relaxed text-faint">
-              Local Ollama only for now. API keys and custom providers are coming.
+              Models run locally through Ollama — nothing leaves this machine.
             </p>
           </div>
         )}
 
-        {modelsError && (
+        {showSettings && cli && (
+          <div className="flex flex-col gap-1.5">
+            <label className="font-mono text-[9.5px] tracking-[0.1em] text-faint uppercase">
+              {PROVIDER_LABELS[cli]} path
+            </label>
+            <Input
+              className="h-7 font-mono text-[11px]"
+              value={cliBinary}
+              onChange={(e) => updateCli("binary", e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setShowSettings(false);
+                }
+              }}
+              placeholder={cliStatus?.path || `leave blank to find \`${cli}\` automatically`}
+              spellCheck={false}
+              aria-label={`${PROVIDER_LABELS[cli]} path`}
+            />
+            <p className="text-[10.5px] leading-relaxed text-faint">
+              Artemis runs your installed {PROVIDER_LABELS[cli]} and reads its reply, so the
+              answer comes from the subscription that CLI is already signed in
+              with. No API key is stored, and it is given no tools — every SQL
+              statement still lands in the editor for you to run.
+            </p>
+          </div>
+        )}
+
+        {modelsError && !cli && (
           <p className="font-mono text-[11px] leading-relaxed text-destructive/90">{modelsError}</p>
         )}
       </div>
@@ -698,9 +1107,7 @@ export default function ChatPanel(props: Props) {
         <MessageScroller className="min-h-0 flex-1">
           <MessageScrollerViewport className="px-3 py-3">
             <MessageScrollerContent className="gap-5">
-              {turns.length === 0 && (
-                <EmptyState hasModel={!!model} />
-              )}
+              {turns.length === 0 && <EmptyState provider={provider} ready={backendReady} />}
               {turns.map((turn, index) => (
                 <MessageScrollerItem
                   key={turn.id}
@@ -724,7 +1131,13 @@ export default function ChatPanel(props: Props) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onInputKeyDown}
-          placeholder={model ? "Ask for a query or report…" : "Pick a model to start"}
+          placeholder={
+            backendReady
+              ? "Ask for a query or report…"
+              : cli
+                ? `Install the ${PROVIDER_LABELS[cli]} to start`
+                : "Pick a model to start"
+          }
           rows={1}
           spellCheck={false}
           aria-label="Message"
@@ -743,18 +1156,48 @@ export default function ChatPanel(props: Props) {
   );
 }
 
-function EmptyState({ hasModel }: { hasModel: boolean }) {
+/// What the look-up found. Three states worth telling apart: still looking,
+/// found (with the version, so a stale CLI is visible), and not found — the
+/// last of which is guidance, not an error, because installing the CLI is
+/// the fix and the user has not done anything wrong.
+function CliStatusLine({ provider, status }: { provider: CliProvider; status: AgentStatus | null }) {
+  if (!status) {
+    return (
+      <p className="font-mono text-[10px] leading-relaxed text-faint">
+        looking for {provider}…
+      </p>
+    );
+  }
+  if (!status.installed) {
+    // The shell's own words: "not found" and "could not be run" are
+    // different problems, and only one of them is fixed by installing.
+    return (
+      <p className="font-mono text-[10px] leading-relaxed text-destructive/80">
+        {status.message || `${provider} is unavailable`}
+      </p>
+    );
+  }
+  return (
+    <p className="font-mono text-[10px] leading-relaxed text-faint" title={status.path}>
+      {status.version || provider} · signed in through the CLI
+    </p>
+  );
+}
+
+function EmptyState({ provider, ready }: { provider: Provider; ready: boolean }) {
+  const cli = isCliProvider(provider) ? provider : null;
+  const blurb = ready
+    ? "Describe the query or report you want. SQL answers get a Send to editor button so you review and run them yourself."
+    : cli
+      ? `${INSTALL_HINTS[cli]} ${LOGIN_HINTS[cli]} Artemis uses that login — there is no API key to enter.`
+      : "This chat runs a local model through Ollama. Choose one above to begin.";
   return (
     <div className="flex flex-col items-center gap-2 px-6 py-10 text-center">
       <Bot className="size-6 text-faint" />
       <p className="text-[12.5px] font-medium text-foreground">
-        {hasModel ? "Ask about your data" : "Pick a model to start"}
+        {ready ? "Ask about your data" : cli ? `Set up the ${PROVIDER_LABELS[cli]}` : "Pick a model to start"}
       </p>
-      <p className="text-[11.5px] leading-relaxed text-muted-foreground">
-        {hasModel
-          ? "Describe the query or report you want. SQL answers get a Send to editor button so you review and run them yourself."
-          : "This chat runs a local model through Ollama. Choose one above to begin."}
-      </p>
+      <p className="text-[11.5px] leading-relaxed text-muted-foreground">{blurb}</p>
     </div>
   );
 }

@@ -29,6 +29,7 @@ const native_sdk = @import("native_sdk");
 const sqlite = @import("sqlite.zig");
 const postgres = @import("postgres.zig");
 const ollama = @import("ollama.zig");
+const agent = @import("agent.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -71,8 +72,29 @@ const OllamaChatPayload = struct {
     id: []const u8 = "",
 };
 
-/// `ollama.cancel` — the stream id to abort.
+/// `ollama.cancel` / `agent.cancel` — the stream id to abort.
 const OllamaCancelPayload = struct {
+    id: []const u8 = "",
+};
+
+/// `agent.status` — is this coding-agent CLI installed, and which build?
+/// `binary` is the user's optional path override; empty means "find it".
+const AgentStatusPayload = struct {
+    provider: []const u8 = "",
+    binary: []const u8 = "",
+};
+
+/// `agent.chat` — one turn through a signed-in CLI. `system` and `prompt`
+/// are built on the web side (this shell composes no prompt), `session`
+/// continues a previous conversation when the CLI supports it, and `id`
+/// correlates the streamed `agent.token` events for `agent.cancel`.
+const AgentChatPayload = struct {
+    provider: []const u8 = "",
+    binary: []const u8 = "",
+    model: []const u8 = "",
+    system: []const u8 = "",
+    prompt: []const u8 = "",
+    session: []const u8 = "",
     id: []const u8 = "",
 };
 
@@ -353,6 +375,11 @@ const ChatRegistry = struct {
     const Slot = struct {
         active: bool = false,
         cancel: std.atomic.Value(bool) = .init(false),
+        /// The child process serving this stream, for the CLI providers;
+        /// 0 when there is none (Ollama) or it has already been reaped.
+        /// A flag alone cannot stop a CLI mid-thought — nothing is read
+        /// until it prints — so cancel signals the process too.
+        pid: std.atomic.Value(i32) = .init(0),
         id: [max_stream_id]u8 = undefined,
         id_len: usize = 0,
     };
@@ -369,6 +396,7 @@ const ChatRegistry = struct {
             if (!slot.active) {
                 slot.active = true;
                 slot.cancel.store(false, .seq_cst);
+                slot.pid.store(0, .seq_cst);
                 slot.id_len = @min(id.len, max_stream_id);
                 @memcpy(slot.id[0..slot.id_len], id[0..slot.id_len]);
                 return slot;
@@ -383,13 +411,16 @@ const ChatRegistry = struct {
         slot.active = false;
     }
 
-    /// Flag the request with this id (if still running) for cancellation.
+    /// Flag the request with this id (if still running) for cancellation,
+    /// and signal its child process when it has one.
     fn cancel(self: *ChatRegistry, id: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (&self.slots) |*slot| {
             if (slot.active and std.mem.eql(u8, slot.id[0..slot.id_len], id)) {
                 slot.cancel.store(true, .seq_cst);
+                const pid = slot.pid.load(.seq_cst);
+                if (pid != 0) agent.signalStop(pid);
             }
         }
     }
@@ -408,6 +439,17 @@ const StreamCtx = struct {
 /// loop. Backpressures when the queue is full so no token is ever dropped —
 /// a dropped delta would silently corrupt the reply.
 fn emitToken(ctx_ptr: *anyopaque, delta: []const u8) void {
+    emitDelta(ctx_ptr, "ollama.token", delta);
+}
+
+/// The same, for a CLI provider. A separate event name keeps the two
+/// backends' streams from ever being confused for one another on the web
+/// side, where each has its own subscriber.
+fn emitAgentToken(ctx_ptr: *anyopaque, delta: []const u8) void {
+    emitDelta(ctx_ptr, "agent.token", delta);
+}
+
+fn emitDelta(ctx_ptr: *anyopaque, name: []const u8, delta: []const u8) void {
     const sc: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
     const page = std.heap.page_allocator;
 
@@ -418,7 +460,7 @@ fn emitToken(ctx_ptr: *anyopaque, delta: []const u8) void {
     const detail = writeJson(scratch, .{ .id = sc.stream_id, .delta = delta }) catch return;
     const owned = page.dupe(u8, detail) catch return;
 
-    const entry = EventEntry{ .name = "ollama.token", .detail = owned };
+    const entry = EventEntry{ .name = name, .detail = owned };
     while (!sc.context.events.tryPush(entry)) {
         // Queue full: wake the loop to drain it, yield, and retry the SAME
         // entry (still owns `owned`, so nothing leaks and nothing is lost).
@@ -436,7 +478,19 @@ fn isCancelled(ctx_ptr: *anyopaque) bool {
     return slot.cancel.load(.seq_cst);
 }
 
-const JobKind = enum { db, store, ollama_tags, ollama_chat };
+/// Sink callback: publish the CLI's pid (or 0 once it is gone) so a cancel
+/// on the loop thread can signal it. A registry that was full simply has
+/// nowhere to put it, and that stream falls back to flag polling.
+fn setPid(ctx_ptr: *anyopaque, pid: i32) void {
+    const sc: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    const slot = sc.slot orelse return;
+    slot.pid.store(pid, .seq_cst);
+    // Stop may have been pressed in the window between spawning and
+    // publishing, in which case nobody would ever signal this child.
+    if (pid != 0 and slot.cancel.load(.seq_cst)) agent.signalStop(pid);
+}
+
+const JobKind = enum { db, store, ollama_tags, ollama_chat, agent_status, agent_chat };
 
 /// Everything a worker needs, copied out of the invocation — the request
 /// bytes belong to the platform and die when the handler returns. Owned by
@@ -453,9 +507,15 @@ const Job = struct {
     /// A `db` job against SQLite rather than Postgres. `store` jobs are always
     /// SQLite and ignore this.
     db_sqlite: bool = false,
-    /// The web-chosen stream id for an `ollama_chat` job (empty otherwise).
+    /// The web-chosen stream id for a chat job (empty otherwise).
     stream_id_storage: [max_stream_id]u8 = undefined,
     stream_id_len: usize = 0,
+    /// The agent jobs' own payload. `url` holds the resolved binary and
+    /// `sql` the prompt, so these are the fields with no db equivalent.
+    provider: agent.Provider = .claude,
+    model: []u8 = &.{},
+    system: []u8 = &.{},
+    session: []u8 = &.{},
 
     fn id(self: *const Job) []const u8 {
         return self.id_storage[0..self.id_len];
@@ -469,6 +529,9 @@ const Job = struct {
         const allocator = std.heap.page_allocator;
         if (self.url.len > 0) allocator.free(self.url);
         if (self.sql.len > 0) allocator.free(self.sql);
+        if (self.model.len > 0) allocator.free(self.model);
+        if (self.system.len > 0) allocator.free(self.system);
+        if (self.session.len > 0) allocator.free(self.session);
         allocator.destroy(self);
     }
 };
@@ -483,6 +546,10 @@ const Context = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     store_path: []const u8,
+    /// Our own environment, which the agent jobs hand (minus the API-key
+    /// overrides) to the CLIs they spawn. Read-only after start-up, so
+    /// workers may share it.
+    env_map: *std.process.Environ.Map,
 
     completions: CompletionQueue = .{},
     stash: Stash = .{},
@@ -542,6 +609,16 @@ const Context = struct {
         self.startJob(.ollama_chat, invocation, responder);
     }
 
+    fn agentStatusStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation, responder: native_sdk.bridge.AsyncResponder) anyerror!void {
+        const self: *Context = @ptrCast(@alignCast(context));
+        self.startJob(.agent_status, invocation, responder);
+    }
+
+    fn agentChatStart(context: *anyopaque, invocation: native_sdk.bridge.Invocation, responder: native_sdk.bridge.AsyncResponder) anyerror!void {
+        const self: *Context = @ptrCast(@alignCast(context));
+        self.startJob(.agent_chat, invocation, responder);
+    }
+
     fn startJob(self: *Context, kind: JobKind, invocation: native_sdk.bridge.Invocation, responder: native_sdk.bridge.AsyncResponder) void {
         const request_id = invocation.request.id;
 
@@ -553,6 +630,10 @@ const Context = struct {
         var sql: []const u8 = "";
         var stream_id: []const u8 = "";
         var db_sqlite = false;
+        var provider: agent.Provider = .claude;
+        var model: []const u8 = "";
+        var system: []const u8 = "";
+        var session: []const u8 = "";
         switch (kind) {
             .db => {
                 const parsed = std.json.parseFromSliceLeaky(
@@ -600,17 +681,51 @@ const Context = struct {
                 sql = parsed.body;
                 stream_id = parsed.id;
             },
+            // The CLI providers. `binary` is resolved on the worker, not
+            // here: probing the filesystem for an install is exactly the
+            // kind of work the loop thread must not do.
+            .agent_status => {
+                const parsed = std.json.parseFromSliceLeaky(
+                    AgentStatusPayload,
+                    arena,
+                    invocation.request.payload,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return respondError(responder, request_id, "invalid payload");
+                provider = agent.Provider.parse(parsed.provider) orelse
+                    return respondError(responder, request_id, "unknown provider");
+                url = parsed.binary;
+            },
+            .agent_chat => {
+                const parsed = std.json.parseFromSliceLeaky(
+                    AgentChatPayload,
+                    arena,
+                    invocation.request.payload,
+                    .{ .ignore_unknown_fields = true },
+                ) catch return respondError(responder, request_id, "invalid payload");
+                provider = agent.Provider.parse(parsed.provider) orelse
+                    return respondError(responder, request_id, "unknown provider");
+                if (parsed.prompt.len == 0) return respondError(responder, request_id, "missing prompt");
+                url = parsed.binary;
+                sql = parsed.prompt;
+                model = parsed.model;
+                system = parsed.system;
+                session = parsed.session;
+                stream_id = parsed.id;
+            },
         }
 
         const allocator = std.heap.page_allocator;
         const job = allocator.create(Job) catch return respondError(responder, request_id, "out of memory");
-        job.* = .{ .context = self, .kind = kind, .responder = responder, .db_sqlite = db_sqlite };
+        job.* = .{ .context = self, .kind = kind, .responder = responder, .db_sqlite = db_sqlite, .provider = provider };
         job.id_len = @min(request_id.len, job.id_storage.len);
         @memcpy(job.id_storage[0..job.id_len], request_id[0..job.id_len]);
         job.stream_id_len = @min(stream_id.len, max_stream_id);
         @memcpy(job.stream_id_storage[0..job.stream_id_len], stream_id[0..job.stream_id_len]);
         job.url = if (url.len > 0) allocator.dupe(u8, url) catch return failJob(job, "out of memory") else &.{};
         job.sql = if (sql.len > 0) allocator.dupe(u8, sql) catch return failJob(job, "out of memory") else &.{};
+        job.model = if (model.len > 0) allocator.dupe(u8, model) catch return failJob(job, "out of memory") else &.{};
+        job.system = if (system.len > 0) allocator.dupe(u8, system) catch return failJob(job, "out of memory") else &.{};
+        job.session = if (session.len > 0) allocator.dupe(u8, session) catch return failJob(job, "out of memory") else &.{};
 
         const thread = std.Thread.spawn(.{}, workerMain, .{job}) catch return failJob(job, "could not start a worker thread");
         thread.detach();
@@ -649,6 +764,8 @@ const Context = struct {
             .store => runStore(job, arena_state.allocator()),
             .ollama_tags => runOllamaTags(job, arena_state.allocator()),
             .ollama_chat => runOllamaChat(job, arena_state.allocator()),
+            .agent_status => runAgentStatus(job, arena_state.allocator()),
+            .agent_chat => runAgentChat(job, arena_state.allocator()),
         };
 
         const envelope = buildEnvelope(arena_state.allocator(), job.id(), result) catch {
@@ -785,6 +902,66 @@ const Context = struct {
         // The reply text rode the token stream; the response carries only the
         // outcome. `finish` on an empty `out` fits one response trivially.
         return job.context.finish("", result.code, result.err);
+    }
+
+    /// Where a spawned CLI runs. The app's own data directory rather than
+    /// wherever Artemis happened to be launched from: these CLIs read the
+    /// project files of their cwd (CLAUDE.md, AGENTS.md, git state), and a
+    /// database chat has no business picking up someone's repository.
+    fn agentCwd(job: *Job) []const u8 {
+        const path = job.context.store_path;
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return ".";
+        return if (slash == 0) "/" else path[0..slash];
+    }
+
+    /// Is this CLI installed, and which version? The answer rides `out` as
+    /// `{"path":…,"version":…}` so the panel can say what it found before
+    /// the user spends a request finding out.
+    fn runAgentStatus(job: *Job, arena: std.mem.Allocator) ExecResult {
+        const binary = agent.resolve(arena, job.context.io, job.context.env_map, job.provider, job.url);
+        const result = agent.version(job.context.gpa, arena, job.context.io, job.context.env_map, binary);
+        if (result.code != 0) return job.context.finish("", result.code, result.err);
+
+        // The arena, not the stack: this slice is read by `buildEnvelope`
+        // after the runner has returned.
+        const buffer = arena.alloc(u8, 4096) catch
+            return job.context.finish("", -1, "out of memory");
+        const payload = writeJson(buffer, .{ .path = binary, .version = result.out }) catch
+            return job.context.finish("", -1, "could not report the CLI status");
+        return job.context.finish(payload, 0, "");
+    }
+
+    /// One turn through a signed-in coding-agent CLI. Same streaming
+    /// contract as `runOllamaChat`: the reply text rides `agent.token`
+    /// events and the response carries only the outcome — plus the session
+    /// handle, so the next question can continue rather than resend the
+    /// whole schema.
+    fn runAgentChat(job: *Job, arena: std.mem.Allocator) ExecResult {
+        const slot = job.context.chats.acquire(job.streamId());
+        defer if (slot) |s| job.context.chats.release(s);
+
+        var stream_ctx = StreamCtx{
+            .context = job.context,
+            .slot = slot,
+            .stream_id = job.streamId(),
+        };
+        const sink = agent.Sink{
+            .context = &stream_ctx,
+            .emit = emitAgentToken,
+            .cancelled = isCancelled,
+            .pid = setPid,
+        };
+        const binary = agent.resolve(arena, job.context.io, job.context.env_map, job.provider, job.url);
+        const result = agent.chat(arena, job.context.io, job.context.env_map, .{
+            .provider = job.provider,
+            .binary = binary,
+            .model = job.model,
+            .system = job.system,
+            .prompt = job.sql,
+            .session = job.session,
+            .cwd = agentCwd(job),
+        }, sink);
+        return job.context.finish(result.out, result.code, result.err);
     }
 
     fn buildEnvelope(arena: std.mem.Allocator, request_id: []const u8, result: ExecResult) ![]const u8 {
@@ -924,6 +1101,9 @@ const bridge_commands = [_]native_sdk.bridge.CommandPolicy{
     .{ .name = "ollama.tags", .origins = &dev_origins },
     .{ .name = "ollama.chat", .origins = &dev_origins },
     .{ .name = "ollama.cancel", .origins = &dev_origins },
+    .{ .name = "agent.status", .origins = &dev_origins },
+    .{ .name = "agent.chat", .origins = &dev_origins },
+    .{ .name = "agent.cancel", .origins = &dev_origins },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -935,6 +1115,7 @@ pub fn main(init: std.process.Init) !void {
         .gpa = init.gpa,
         .io = init.io,
         .store_path = store_path,
+        .env_map = init.environ_map,
     };
     var app = App{ .env_map = init.environ_map, .bridge_context = &context };
 
@@ -942,12 +1123,16 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "db.chunk", .context = &context, .invoke_fn = Context.chunkRead },
         .{ .name = "dialog.pickFile", .context = &context, .invoke_fn = Context.pickFile },
         .{ .name = "ollama.cancel", .context = &context, .invoke_fn = Context.ollamaCancel },
+        // One registry serves both backends, so one handler cancels either.
+        .{ .name = "agent.cancel", .context = &context, .invoke_fn = Context.ollamaCancel },
     };
     const async_handlers = [_]native_sdk.bridge.AsyncHandler{
         .{ .name = "db.exec", .context = &context, .invoke_fn = Context.execStart },
         .{ .name = "store.exec", .context = &context, .invoke_fn = Context.storeStart },
         .{ .name = "ollama.tags", .context = &context, .invoke_fn = Context.ollamaTagsStart },
         .{ .name = "ollama.chat", .context = &context, .invoke_fn = Context.ollamaChatStart },
+        .{ .name = "agent.status", .context = &context, .invoke_fn = Context.agentStatusStart },
+        .{ .name = "agent.chat", .context = &context, .invoke_fn = Context.agentChatStart },
     };
     const dispatcher = native_sdk.BridgeDispatcher{
         .policy = .{ .enabled = true, .commands = &bridge_commands },

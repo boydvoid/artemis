@@ -70,11 +70,11 @@ import {
 } from "@/lib/parse";
 import { dialectForUrl } from "@/lib/db";
 import {
+  DEFAULT_AI_SETTINGS,
   loadAiSettings,
-  saveEndpoint as storeSaveEndpoint,
-  saveModel as storeSaveModel,
+  saveAiSettings,
+  type AiSettings,
 } from "@/lib/aiStore";
-import { DEFAULT_ENDPOINT } from "@/lib/ollama";
 import { clearSession, hydrateTab, loadSession, saveSession, storeTab } from "@/lib/session";
 import { applyTheme, loadTheme, saveTheme, type Theme } from "@/lib/theme";
 import {
@@ -171,11 +171,11 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // The AI chat panel and its Ollama settings. Endpoint and model persist in
-  // the store like any other preference; the panel owns the conversation.
+  // The AI chat panel and its backend settings — which provider, and each
+  // provider's endpoint/model. They persist in the store like any other
+  // preference; the panel owns the conversation.
   const [showChat, setShowChat] = useState(false);
-  const [aiEndpoint, setAiEndpoint] = useState(DEFAULT_ENDPOINT);
-  const [aiModel, setAiModel] = useState("");
+  const [ai, setAi] = useState<AiSettings>(DEFAULT_AI_SETTINGS);
 
   /// Queries can overlap — opening a restored workspace starts the catalog
   /// load and the active tab's first run together — so busy is a count, not
@@ -225,7 +225,7 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [rows, savedRows, activeConn, ai] = await Promise.all([
+        const [rows, savedRows, activeConn, aiSettings] = await Promise.all([
           loadConnections(),
           loadSavedQueries(),
           loadActiveId(),
@@ -234,8 +234,7 @@ export default function App() {
         if (cancelled) return;
         setConnections(rows);
         setSaved(savedRows);
-        setAiEndpoint(ai.endpoint);
-        setAiModel(ai.model);
+        setAi(aiSettings);
 
         const known = rows.some((c) => c.id === activeConn);
         if (known) setActiveId(activeConn);
@@ -930,15 +929,11 @@ export default function App() {
     [active, dialect],
   );
 
-  /// Selecting a model or endpoint also persists it, like the active
-  /// connection — a preference that should survive a restart.
-  function updateAiModel(next: string) {
-    setAiModel(next);
-    void storeSaveModel(next);
-  }
-  function updateAiEndpoint(next: string) {
-    setAiEndpoint(next);
-    void storeSaveEndpoint(next);
+  /// Changing a chat setting also persists it, like the active connection —
+  /// a preference that should survive a restart.
+  function updateAi(patch: Partial<AiSettings>) {
+    setAi((prev) => ({ ...prev, ...patch }));
+    void saveAiSettings(patch);
   }
 
   const stagedRowCount = new Set(tab.staged.map((e) => e.key)).size;
@@ -1252,10 +1247,8 @@ export default function App() {
           than over it, so results stay in view while you ask about them. */}
       {showChat && (
         <ChatPanel
-          endpoint={aiEndpoint}
-          setEndpoint={updateAiEndpoint}
-          model={aiModel}
-          setModel={updateAiModel}
+          settings={ai}
+          updateSettings={updateAi}
           tables={tables}
           schema={schema}
           foreignKeys={foreignKeys}
@@ -1263,6 +1256,7 @@ export default function App() {
           runProbe={runChatProbe}
           dialectName={dialect.driver}
           connectionName={active ? active.name : ""}
+          connectionId={active ? active.id : 0}
           onSendToEditor={sendToEditor}
           onClose={() => setShowChat(false)}
         />

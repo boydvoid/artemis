@@ -57,6 +57,28 @@ pub fn exec(arena: std.mem.Allocator, io: Io, url: []const u8, sql: []const u8) 
     // turn is what makes a machine with no IPv6 route still connect.
     const addresses = resolveHost(arena, conn.host, conn.port) catch |err|
         return fail(arena, "could not resolve {s} ({s})", .{ conn.host, @errorName(err) });
+
+    // libpq's `prefer` makes up to two connection attempts: TLS first, then a
+    // fresh plaintext one if the handshake fails. Match that — a failed
+    // handshake leaves the socket unusable, so the retry needs its own. The
+    // common case here is a server that asks for a client certificate, which
+    // std's TLS 1.3 client cannot answer (it reports TlsUnexpectedMessage).
+    return attempt(arena, io, &conn, addresses, sql, conn.sslmode != .disable) catch
+        attempt(arena, io, &conn, addresses, sql, false) catch |err|
+        fail(arena, "could not connect ({s})", .{@errorName(err)});
+}
+
+/// One connection attempt. Everything that can go wrong comes back as a
+/// `Result`; `error.RetryPlaintext` is the single exception, asking the caller
+/// for a second attempt on a fresh socket without TLS.
+fn attempt(
+    arena: std.mem.Allocator,
+    io: Io,
+    conn: *Conn,
+    addresses: []const Io.net.IpAddress,
+    sql: []const u8,
+    use_tls: bool,
+) error{RetryPlaintext}!Result {
     var stream: Io.net.Stream = undefined;
     var connect_err: anyerror = error.HostNotFound;
     var connected = false;
@@ -89,18 +111,32 @@ pub fn exec(arena: std.mem.Allocator, io: Io, url: []const u8, sql: []const u8) 
     // ---- TLS (sslmode). A single SSLRequest byte tells us whether the
     // server speaks it; the handshake then swaps pg.r/pg.w to the encrypted
     // streams while transport stays the raw socket writer.
-    if (conn.sslmode != .disable) {
-        pg.establishTls(&conn) catch |err| switch (err) {
-            error.SslDeclined => if (conn.sslmode == .require or conn.sslmode == .verify_ca or conn.sslmode == .verify_full)
+    if (use_tls) {
+        const required = conn.sslmode == .require or conn.sslmode == .verify_ca or conn.sslmode == .verify_full;
+        pg.establishTls(conn) catch |err| switch (err) {
+            // 'N': the server has SSL turned off. Nothing was sent on the
+            // socket beyond the SSLRequest, so plaintext continues here.
+            error.SslDeclined => if (required)
                 return fail(arena, "the server does not support SSL, but sslmode requires it", .{})
-            else {}, // prefer: fall through on plaintext
-            else => return fail(arena, "TLS handshake failed ({s})", .{@errorName(err)}),
+            else {},
+            // A handshake that got underway and failed leaves the socket
+            // mid-record; `prefer` retries from scratch without TLS.
+            else => {
+                if (!required) return error.RetryPlaintext;
+                return fail(arena, "TLS handshake failed ({s}){s}", .{
+                    @errorName(err),
+                    if (err == error.TlsUnexpectedMessage)
+                        " — the server asks for a client certificate, which this client cannot send. Use sslmode=disable over a private link (an SSH tunnel or private network)."
+                    else
+                        "",
+                });
+            },
         };
     }
 
     // ---- Startup + authentication.
-    pg.startup(&conn) catch |err| return fail(arena, "startup failed ({s})", .{@errorName(err)});
-    pg.authenticate(&conn) catch |err| switch (err) {
+    pg.startup(conn) catch |err| return fail(arena, "startup failed ({s})", .{@errorName(err)});
+    pg.authenticate(conn) catch |err| switch (err) {
         error.AuthFailed => return .{ .out = "", .code = 1, .err = conn.auth_error orelse "authentication failed" },
         else => return fail(arena, "authentication failed ({s})", .{@errorName(err)}),
     };
