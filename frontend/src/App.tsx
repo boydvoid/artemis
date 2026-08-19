@@ -50,6 +50,7 @@ import {
   loadSavedQueries,
   saveActiveId,
   saveQuery,
+  updateConnection as storeUpdate,
   updateSavedQuery,
   type Connection,
   type SavedQuery,
@@ -406,6 +407,10 @@ export default function App() {
   // to. This replaces the old behavior of keeping statement text through a
   // switch, which per-connection persistence turned from convenience into
   // cross-contamination.
+  //
+  // The URL is a dependency too: editing the active connection's URL points
+  // it at a different database, and the table rail would otherwise keep
+  // describing the old one.
   useEffect(() => {
     const prev = prevConnectionRef.current;
     prevConnectionRef.current = activeId;
@@ -451,7 +456,7 @@ export default function App() {
 
     void loadTables();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId]);
+  }, [activeId, active?.url]);
 
   // Autocomplete reads the schema we already loaded for the rail, plus the
   // columns of whatever the active tab last returned.
@@ -856,6 +861,14 @@ export default function App() {
     }
   }
 
+  async function editConnection(id: number, name: string, url: string) {
+    try {
+      setConnections(await storeUpdate(id, name, url));
+    } catch (storeError) {
+      setError(storeError instanceof Error ? storeError.message : String(storeError));
+    }
+  }
+
   async function removeConnection(id: number) {
     try {
       setConnections(await storeDelete(id));
@@ -987,6 +1000,7 @@ export default function App() {
           onAdd={() => void addConnection()}
           onOpen={openConnection}
           onRemove={(id) => void removeConnection(id)}
+          onUpdate={(id, name, url) => void editConnection(id, name, url)}
           theme={theme}
           setTheme={setTheme}
         />

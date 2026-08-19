@@ -6,7 +6,7 @@
 // connection is what opens the workspace.
 
 import { useState } from "react";
-import { FolderOpen, Plus, Trash2 } from "lucide-react";
+import { Check, FolderOpen, Pencil, Plus, Trash2 } from "lucide-react";
 import Logo from "@/components/Logo";
 import ThemeToggle from "@/components/ThemeToggle";
 import { Button } from "@/components/ui/button";
@@ -53,6 +53,7 @@ interface Props {
   onAdd: () => void;
   onOpen: (id: number) => void;
   onRemove: (id: number) => void;
+  onUpdate: (id: number, name: string, url: string) => void;
   theme: Theme;
   setTheme: (next: Theme) => void;
 }
@@ -67,11 +68,40 @@ export default function Connections(props: Props) {
   // a Postgres URL means nothing to SQLite and vice versa.
   const [engine, setEngine] = useState<DbKind>("postgres");
 
-  // The native file picker fills the path in. Only offered inside the shell —
-  // a plain browser tab has no picker, so the typed path stays the way in.
-  async function browseSqlite() {
-    const path = await pickSqliteFile();
-    if (path) props.setDraftUrl(urlForEngine("sqlite", path));
+  // Editing happens in place, on the row itself, so the list stays the map of
+  // what you have. Zero means nothing is being edited — ids start at 1.
+  const [editId, setEditId] = useState(0);
+  const [editName, setEditName] = useState("");
+  const [editUrl, setEditUrl] = useState("");
+  const [editMode, setEditMode] = useState<"url" | "fields">("url");
+  const [editFields, setEditFields] = useState<ConnectionFields>(EMPTY_FIELDS);
+
+  function startEdit(c: Connection) {
+    setEditId(c.id);
+    setEditName(c.name);
+    setEditUrl(c.url);
+    // The URL box is the honest starting view: it shows exactly what is
+    // stored, including anything the field editor could not have produced.
+    setEditMode("url");
+    setEditFields(EMPTY_FIELDS);
+  }
+
+  function saveEdit(c: Connection) {
+    const url = editUrl.trim();
+    if (url.length === 0 || props.busy) return;
+    props.onUpdate(c.id, editName.trim() || url, url);
+    setEditId(0);
+  }
+
+  function showEditFields() {
+    setEditFields(parseUrl(editUrl) ?? EMPTY_FIELDS);
+    setEditMode("fields");
+  }
+
+  function setEditField(key: keyof ConnectionFields, value: string) {
+    const next = { ...editFields, [key]: value };
+    setEditFields(next);
+    setEditUrl(buildUrl(next));
   }
 
   function switchEngine(next: DbKind) {
@@ -143,6 +173,90 @@ export default function Connections(props: Props) {
               {props.connections.map((c, i) => {
                 const isActive = c.id === props.activeId;
                 const delay = `${140 + i * 55}ms`;
+                // The engine is a property of the stored URL, not a question
+                // to re-ask: a saved connection already knows what it is.
+                const kind = connectionKind(c.url);
+                if (c.id === editId) {
+                  return (
+                    <li key={c.id}>
+                      <div
+                        className="flex items-stretch bg-accent/25"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            saveEdit(c);
+                          } else if (e.key === "Escape") {
+                            e.preventDefault();
+                            setEditId(0);
+                          }
+                        }}
+                      >
+                        <div className="flex w-[52px] flex-none items-center justify-center border-r border-hairline">
+                          <span className="font-mono text-[9px] tracking-[0.1em] text-faint">
+                            {String(i + 1).padStart(2, "0")}
+                          </span>
+                        </div>
+                        <div className="flex min-w-0 flex-1 flex-col gap-3 px-4 py-3">
+                          <div className="flex items-end gap-2.5">
+                            <Field label="name" className="w-[180px] flex-none">
+                              <Input
+                                className="h-8 font-mono text-[12px]"
+                                value={editName}
+                                onChange={(e) => setEditName(e.target.value)}
+                                placeholder="my database"
+                                aria-label="Connection name"
+                                autoFocus
+                              />
+                            </Field>
+                            {kind === "postgres" && editMode === "url" && (
+                              <UrlField
+                                className="flex-1"
+                                value={editUrl}
+                                onChange={setEditUrl}
+                              />
+                            )}
+                            {kind === "sqlite" && (
+                              <SqliteField
+                                className="flex-1"
+                                value={editUrl}
+                                onChange={setEditUrl}
+                              />
+                            )}
+                            {kind === "postgres" && editMode === "fields" && (
+                              <span className="flex-1" />
+                            )}
+                            {kind === "postgres" && (
+                              <Segment>
+                                <ModeTab
+                                  active={editMode === "url"}
+                                  onClick={() => setEditMode("url")}
+                                >
+                                  URL
+                                </ModeTab>
+                                <ModeTab active={editMode === "fields"} onClick={showEditFields}>
+                                  Fields
+                                </ModeTab>
+                              </Segment>
+                            )}
+                            <Button
+                              onClick={() => saveEdit(c)}
+                              disabled={props.busy || editUrl.trim().length === 0}
+                            >
+                              <Check />
+                              Save
+                            </Button>
+                            <Button variant="ghost" onClick={() => setEditId(0)}>
+                              Cancel
+                            </Button>
+                          </div>
+                          {kind === "postgres" && editMode === "fields" && (
+                            <PgFields fields={editFields} setField={setEditField} url={editUrl} />
+                          )}
+                        </div>
+                      </div>
+                    </li>
+                  );
+                }
                 return (
                   <li key={c.id} className="home-rise" style={{ animationDelay: delay }}>
                     <div
@@ -183,7 +297,7 @@ export default function Connections(props: Props) {
                           <span className="text-[14px] leading-none text-foreground">
                             {c.name}
                           </span>
-                          <EngineTag kind={connectionKind(c.url)} />
+                          <EngineTag kind={kind} />
                           <span className="flex-1" />
                           {isActive ? (
                             <span className="font-mono text-[9.5px] tracking-[0.16em] text-amber uppercase">
@@ -198,6 +312,19 @@ export default function Connections(props: Props) {
                       </div>
 
                       <div className="flex flex-none items-center pr-2">
+                        <Button
+                          size="icon-xs"
+                          variant="ghost"
+                          className="opacity-0 transition-opacity group-hover:opacity-100"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startEdit(c);
+                          }}
+                          disabled={props.busy}
+                          aria-label={`Edit ${c.name}`}
+                        >
+                          <Pencil />
+                        </Button>
                         <Button
                           size="icon-xs"
                           variant="ghost"
@@ -263,46 +390,20 @@ export default function Connections(props: Props) {
                 />
               </Field>
               {engine === "postgres" && mode === "url" && (
-                <Field label="connection string" className="flex-1">
-                  <Input
-                    className="h-8 font-mono text-[12px]"
-                    value={props.draftUrl}
-                    onChange={(e) => props.setDraftUrl(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && props.onAdd()}
-                    placeholder="postgres://user:password@localhost:5432/postgres"
-                    aria-label="Connection string"
-                  />
-                </Field>
+                <UrlField
+                  className="flex-1"
+                  value={props.draftUrl}
+                  onChange={props.setDraftUrl}
+                  onSubmit={props.onAdd}
+                />
               )}
               {engine === "sqlite" && (
-                <Field label="database file" className="flex-1">
-                  <div className="flex h-8 items-center overflow-hidden rounded-md border border-input bg-transparent font-mono text-[12px] focus-within:border-ring dark:bg-input/30">
-                    <span className="flex-none border-r border-hairline px-2 py-1.5 text-faint select-none">
-                      sqlite:
-                    </span>
-                    <input
-                      className="h-full min-w-0 flex-1 bg-transparent px-2 text-foreground outline-none placeholder:text-faint"
-                      value={sqlitePathOf(props.draftUrl)}
-                      onChange={(e) =>
-                        props.setDraftUrl(urlForEngine("sqlite", e.target.value))
-                      }
-                      onKeyDown={(e) => e.key === "Enter" && props.onAdd()}
-                      placeholder="/absolute/path/to/database.db"
-                      aria-label="SQLite file path"
-                    />
-                    {bridgeAvailable() && (
-                      <button
-                        className="flex h-full flex-none items-center gap-1 border-l border-hairline px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-amber"
-                        onClick={() => void browseSqlite()}
-                        type="button"
-                        aria-label="Browse for a SQLite file"
-                      >
-                        <FolderOpen className="size-3.5" />
-                        Browse
-                      </button>
-                    )}
-                  </div>
-                </Field>
+                <SqliteField
+                  className="flex-1"
+                  value={props.draftUrl}
+                  onChange={props.setDraftUrl}
+                  onSubmit={props.onAdd}
+                />
               )}
               {engine === "postgres" && mode === "fields" && <span className="flex-1" />}
               <Button onClick={props.onAdd} disabled={props.busy}>
@@ -311,97 +412,13 @@ export default function Connections(props: Props) {
               </Button>
             </div>
 
-            {mode === "fields" && (
-              <>
-                <div className="grid grid-cols-3 gap-2.5">
-                <Field label="host">
-                  <Input
-                    className="h-8 font-mono text-[12px]"
-                    value={fields.host}
-                    onChange={(e) => setField("host", e.target.value)}
-                    placeholder="localhost"
-                    aria-label="Host"
-                  />
-                </Field>
-                <Field label="port">
-                  <Input
-                    className="h-8 font-mono text-[12px]"
-                    value={fields.port}
-                    onChange={(e) => setField("port", e.target.value)}
-                    placeholder="5432"
-                    inputMode="numeric"
-                    aria-label="Port"
-                  />
-                </Field>
-                <Field label="database">
-                  <Input
-                    className="h-8 font-mono text-[12px]"
-                    value={fields.database}
-                    onChange={(e) => setField("database", e.target.value)}
-                    placeholder="postgres"
-                    aria-label="Database"
-                  />
-                </Field>
-                <Field label="user">
-                  <Input
-                    className="h-8 font-mono text-[12px]"
-                    value={fields.user}
-                    onChange={(e) => setField("user", e.target.value)}
-                    placeholder="postgres"
-                    aria-label="User"
-                  />
-                </Field>
-                <Field label="password">
-                  <Input
-                    className="h-8 font-mono text-[12px]"
-                    type="password"
-                    value={fields.password}
-                    onChange={(e) => setField("password", e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && props.onAdd()}
-                    aria-label="Password"
-                  />
-                </Field>
-                <Field label="ssl mode">
-                  <Select
-                    value={fields.sslmode}
-                    onValueChange={(next) => setField("sslmode", next ?? "")}
-                  >
-                    <SelectTrigger
-                      size="sm"
-                      className="h-8 w-full font-mono text-[12px]"
-                      aria-label="SSL mode"
-                    >
-                      <SelectValue>{(value) => (value ? String(value) : "default")}</SelectValue>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {SSL_MODES.map((value) => (
-                        <SelectItem
-                          key={value || "default"}
-                          value={value}
-                          className="font-mono text-[11.5px]"
-                        >
-                          {value || "default"}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </Field>
-              </div>
-
-                {/* The URL these fields make. Shown because it is what
-                    actually gets stored, and because it is where you can see a
-                    password with an `@` in it come out correctly escaped. */}
-                <div className="flex items-center gap-2 border-t border-hairline pt-2.5">
-                  <span className="font-mono text-[9px] tracking-[0.14em] text-faint uppercase">
-                    url
-                  </span>
-                  <p className="min-w-0 flex-1 overflow-x-auto font-mono text-[10.5px] whitespace-nowrap text-muted-foreground">
-                    {props.draftUrl || (
-                      <span className="text-faint">a host is needed to form a connection URL</span>
-                    )}
-                  </p>
-                </div>
-              </>
+            {engine === "postgres" && mode === "fields" && (
+              <PgFields
+                fields={fields}
+                setField={setField}
+                url={props.draftUrl}
+                onSubmit={props.onAdd}
+              />
             )}
           </div>
         </Panel>
@@ -508,5 +525,171 @@ function Field(props: { label: string; className?: string; children: React.React
       </span>
       {props.children}
     </label>
+  );
+}
+
+/// The Postgres connection-string box. Shared by the add panel and the
+/// in-place row editor so both accept exactly the same input.
+function UrlField(props: {
+  value: string;
+  onChange: (url: string) => void;
+  onSubmit?: () => void;
+  className?: string;
+}) {
+  return (
+    <Field label="connection string" className={props.className}>
+      <Input
+        className="h-8 font-mono text-[12px]"
+        value={props.value}
+        onChange={(e) => props.onChange(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && props.onSubmit?.()}
+        placeholder="postgres://user:password@localhost:5432/postgres"
+        aria-label="Connection string"
+      />
+    </Field>
+  );
+}
+
+/// The SQLite path box: the `sqlite:` prefix is fixed furniture rather than
+/// something to type, and the native picker fills the rest in. Browse is only
+/// offered inside the shell — a plain browser tab has no picker, so the typed
+/// path stays the way in.
+function SqliteField(props: {
+  value: string;
+  onChange: (url: string) => void;
+  onSubmit?: () => void;
+  className?: string;
+}) {
+  async function browse() {
+    const path = await pickSqliteFile();
+    if (path) props.onChange(urlForEngine("sqlite", path));
+  }
+
+  return (
+    <Field label="database file" className={props.className}>
+      <div className="flex h-8 items-center overflow-hidden rounded-md border border-input bg-transparent font-mono text-[12px] focus-within:border-ring dark:bg-input/30">
+        <span className="flex-none border-r border-hairline px-2 py-1.5 text-faint select-none">
+          sqlite:
+        </span>
+        <input
+          className="h-full min-w-0 flex-1 bg-transparent px-2 text-foreground outline-none placeholder:text-faint"
+          value={sqlitePathOf(props.value)}
+          onChange={(e) => props.onChange(urlForEngine("sqlite", e.target.value))}
+          onKeyDown={(e) => e.key === "Enter" && props.onSubmit?.()}
+          placeholder="/absolute/path/to/database.db"
+          aria-label="SQLite file path"
+        />
+        {bridgeAvailable() && (
+          <button
+            className="flex h-full flex-none items-center gap-1 border-l border-hairline px-2.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-amber"
+            onClick={() => void browse()}
+            type="button"
+            aria-label="Browse for a SQLite file"
+          >
+            <FolderOpen className="size-3.5" />
+            Browse
+          </button>
+        )}
+      </div>
+    </Field>
+  );
+}
+
+/// The Postgres field editor, plus the URL it makes. Shown because that URL is
+/// what actually gets stored, and because it is where you can see a password
+/// with an `@` in it come out correctly escaped.
+function PgFields(props: {
+  fields: ConnectionFields;
+  setField: (key: keyof ConnectionFields, value: string) => void;
+  url: string;
+  onSubmit?: () => void;
+}) {
+  const { fields, setField } = props;
+  return (
+    <>
+      <div className="grid grid-cols-3 gap-2.5">
+        <Field label="host">
+          <Input
+            className="h-8 font-mono text-[12px]"
+            value={fields.host}
+            onChange={(e) => setField("host", e.target.value)}
+            placeholder="localhost"
+            aria-label="Host"
+          />
+        </Field>
+        <Field label="port">
+          <Input
+            className="h-8 font-mono text-[12px]"
+            value={fields.port}
+            onChange={(e) => setField("port", e.target.value)}
+            placeholder="5432"
+            inputMode="numeric"
+            aria-label="Port"
+          />
+        </Field>
+        <Field label="database">
+          <Input
+            className="h-8 font-mono text-[12px]"
+            value={fields.database}
+            onChange={(e) => setField("database", e.target.value)}
+            placeholder="postgres"
+            aria-label="Database"
+          />
+        </Field>
+        <Field label="user">
+          <Input
+            className="h-8 font-mono text-[12px]"
+            value={fields.user}
+            onChange={(e) => setField("user", e.target.value)}
+            placeholder="postgres"
+            aria-label="User"
+          />
+        </Field>
+        <Field label="password">
+          <Input
+            className="h-8 font-mono text-[12px]"
+            type="password"
+            value={fields.password}
+            onChange={(e) => setField("password", e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && props.onSubmit?.()}
+            aria-label="Password"
+          />
+        </Field>
+        <Field label="ssl mode">
+          <Select
+            value={fields.sslmode}
+            onValueChange={(next) => setField("sslmode", next ?? "")}
+          >
+            <SelectTrigger
+              size="sm"
+              className="h-8 w-full font-mono text-[12px]"
+              aria-label="SSL mode"
+            >
+              <SelectValue>{(value) => (value ? String(value) : "default")}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {SSL_MODES.map((value) => (
+                <SelectItem
+                  key={value || "default"}
+                  value={value}
+                  className="font-mono text-[11.5px]"
+                >
+                  {value || "default"}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+      </div>
+
+      <div className="flex items-center gap-2 border-t border-hairline pt-2.5">
+        <span className="font-mono text-[9px] tracking-[0.14em] text-faint uppercase">url</span>
+        <p className="min-w-0 flex-1 overflow-x-auto font-mono text-[10.5px] whitespace-nowrap text-muted-foreground">
+          {props.url || (
+            <span className="text-faint">a host is needed to form a connection URL</span>
+          )}
+        </p>
+      </div>
+    </>
   );
 }
